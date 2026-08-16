@@ -1,5 +1,5 @@
-"""
-pipeline/smooth_coords.py — Phase 1: Architecture & Contract Stub
+﻿"""
+pipeline/smooth_coords.py — Phase 1 & 4: Coordinate Smoothing Stub & Contracts
 
 Contract:
   Inputs:  raw_coords.json, text_regions.json, focus_timeline.json
@@ -11,7 +11,7 @@ Filled in during Phase 4, Steps 7-10:
   - Step 9:  Protected-region clamp against text_regions.json.
   - Step 10: Eased transitions over ~15 frames.
 
-Supports --mock flag to generate valid schema-compliant mock coords for testing Phase 1.
+Supports --mock flag to generate valid schema-compliant mock coords for testing.
 """
 import argparse
 import sys
@@ -38,11 +38,9 @@ def generate_mock_final_coords(
     src_w = raw_coords.get("width", 1920)
     src_h = raw_coords.get("height", 1080)
 
-    # 9:16 Crop: 608x1080
     crop_w_916 = 608
     crop_h_916 = 1080
 
-    # 1:1 Crop: 1080x1080
     crop_w_11 = 1080
     crop_h_11 = 1080
 
@@ -54,13 +52,12 @@ def generate_mock_final_coords(
         raw_f = raw_coords.get("frames", [])[i] if i < len(raw_coords.get("frames", [])) else {}
         focus = raw_f.get("focus", "speaker")
 
-        # In segment 2 (3.5s - 6.8s), crop shifts right towards the pointed chart
         if 3.5 <= t <= 6.8:
-            crop_x_916 = 1312  # Clamped to right edge (1920 - 608)
-            crop_x_11 = 840   # Centered on chart/presenter right area
+            crop_x_916 = 1312
+            crop_x_11 = 840
         else:
-            crop_x_916 = (src_w - crop_w_916) // 2  # 656 (Center presenter)
-            crop_x_11 = (src_w - crop_w_11) // 2    # 420 (Center presenter)
+            crop_x_916 = (src_w - crop_w_916) // 2
+            crop_x_11 = (src_w - crop_w_11) // 2
 
         frames_916.append(FinalFrameCoord(
             frame_idx=i,
@@ -109,11 +106,13 @@ def generate_mock_final_coords(
     return coords_916, coords_11
 
 
-def run(raw_coords: dict, text_regions: dict, focus_timeline: dict, mock: bool = False) -> Tuple[dict, dict]:
+def run(
+    raw_coords: dict, text_regions: dict, focus_timeline: dict, mock: bool = False
+) -> Tuple[dict, dict]:
     if mock:
         return generate_mock_final_coords(raw_coords, text_regions, focus_timeline)
     raise NotImplementedError(
-        "Phase 4, Steps 7-10: One Euro smoothing, dual-aspect crop selection & text clamping. (Use --mock for architecture testing)"
+        "Phase 4, Steps 7-10: dual-aspect crop computation, One Euro smoothing, text clamp, eased transitions. (Use --mock for testing)"
     )
 
 

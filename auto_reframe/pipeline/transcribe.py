@@ -83,6 +83,7 @@ def _resolve_whisper_model_path(model_name: str) -> str:
         if c.exists() and (c / "model.bin").exists():
             return str(c)
 
+    # Fallback to local base model if large model not found
     fallback_base = [
         MODELS_DIR / "whisper" / "base",
         PROJECT_ROOT / "models" / "whisper" / "base",
@@ -138,6 +139,12 @@ def generate_mock_transcript(duration: float = 10.37) -> dict:
 
 def run(video_path: Path, model_size: str = "distil-large-v3",
         device: str = "auto", compute_type: str = "auto", mock: bool = False) -> dict:
+    """
+    Executes Faster-Whisper transcription on the video file.
+    Returns:
+        {"language": "en", "duration": 10.37, "text": "...",
+         "words": [{"word": "look", "start": 1.02, "end": 1.20, "confidence": 0.98}, ...]}
+    """
     if mock:
         return generate_mock_transcript()
 
@@ -146,12 +153,14 @@ def run(video_path: Path, model_size: str = "distil-large-v3",
 
     from faster_whisper import WhisperModel
 
+    # Extract audio if video format
     is_wav = video_path.suffix.lower() == ".wav"
     audio_path = video_path if is_wav else _extract_audio(video_path)
 
     model_target = _resolve_whisper_model_path(model_size)
     print(f"[{STAGE_NAME}] Loading Faster-Whisper model from '{model_target}' (device={device}, compute_type={compute_type})...")
 
+    # On CPU with int8 quantization
     comp_type = compute_type
     if comp_type == "auto":
         comp_type = "int8" if device in ("auto", "cpu") else "float16"
@@ -181,10 +190,11 @@ def run(video_path: Path, model_size: str = "distil-large-v3",
                             word=cleaned,
                             start=w.start,
                             end=w.end,
-                            probability=w.probability
+                            confidence=w.probability
                         )
                     )
 
+    # Fallback duration calculation
     dur = info.duration if info.duration > 0 else (words_list[-1].end if words_list else 0.0)
     full_text = " ".join(full_text_parts)
 

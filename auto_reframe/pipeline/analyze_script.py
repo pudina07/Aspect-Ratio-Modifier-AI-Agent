@@ -93,6 +93,7 @@ def _extract_heuristic_focus_blocks(transcript: dict) -> List[Dict[str, Any]]:
     if not words:
         return []
 
+    # Cue phrases indicating object attention
     cues = [
         (re.compile(r"\b(look\s+at|look\s+here|see\s+this|notice\s+the|here\s+is|check\s+out|watch\s+this)\b", re.IGNORECASE), "object", 0.95),
         (re.compile(r"\b(chart|graph|metric|screen|slide|table|diagram|figure|corner)\b", re.IGNORECASE), "object", 0.90),
@@ -104,11 +105,13 @@ def _extract_heuristic_focus_blocks(transcript: dict) -> List[Dict[str, Any]]:
     if not total_duration and words:
         total_duration = words[-1].get("end", 10.0)
 
+    # Build sliding windows of words
     extracted_blocks: List[Dict[str, Any]] = []
     num_words = len(words)
 
     i = 0
     while i < num_words:
+        # Check window of 4 to 8 words
         window_end = min(i + 8, num_words)
         window_words = words[i:window_end]
         window_text = " ".join([w.get("word", "").strip() for w in window_words])
@@ -130,6 +133,7 @@ def _extract_heuristic_focus_blocks(transcript: dict) -> List[Dict[str, Any]]:
         if is_object:
             start_t = window_words[0].get("start", 0.0)
             end_t = window_words[-1].get("end", start_t + 2.0)
+            # Add padding around the gesture/cue
             start_t = max(0.0, start_t - 0.2)
             end_t = min(total_duration, end_t + 0.8)
 
@@ -140,7 +144,7 @@ def _extract_heuristic_focus_blocks(transcript: dict) -> List[Dict[str, Any]]:
                 "direction_hint": direction,
                 "confidence": round(confidence, 3)
             })
-            i = window_end
+            i = window_end  # Skip ahead past this event
         else:
             i += 1
 
@@ -174,6 +178,7 @@ def debounce_timeline(blocks: List[Dict[str, Any]], merge_gap: float = 1.0, min_
         else:
             merged.append(block)
 
+    # Discard transient flickers shorter than min_duration
     debounced = [b for b in merged if (b["end"] - b["start"]) >= min_duration]
     return debounced
 
@@ -194,6 +199,9 @@ def generate_mock_focus_timeline(transcript: dict) -> dict:
 
 
 def run(transcript: dict, model_name: str = DEFAULT_MODEL, mock: bool = False) -> dict:
+    """
+    Executes script analysis and timeline generation with debouncing.
+    """
     if mock:
         return generate_mock_focus_timeline(transcript)
 
@@ -204,6 +212,7 @@ def run(transcript: dict, model_name: str = DEFAULT_MODEL, mock: bool = False) -
     raw_blocks: List[Dict[str, Any]] = []
     mode_used = "nlp_heuristic"
 
+    # Attempt OpenAI LLM if API key is present
     if os.environ.get("OPENAI_API_KEY"):
         try:
             print(f"[{STAGE_NAME}] Calling OpenAI LLM ({model_name}) with structured JSON output...")
@@ -218,9 +227,11 @@ def run(transcript: dict, model_name: str = DEFAULT_MODEL, mock: bool = False) -
         print(f"[{STAGE_NAME}] OPENAI_API_KEY not set. Running high-precision local semantic NLP cue analyzer...")
         raw_blocks = _extract_heuristic_focus_blocks(transcript)
 
+    # Step 3: Debounce raw blocks
     debounced_blocks = debounce_timeline(raw_blocks)
     print(f"[{STAGE_NAME}] Debounced into {len(debounced_blocks)} stable focus blocks.")
 
+    # Convert to FocusBlock dataclasses
     block_objs = [
         FocusBlock(
             start=b["start"],

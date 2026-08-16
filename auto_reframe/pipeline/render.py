@@ -1,5 +1,5 @@
-"""
-pipeline/render.py — Phase 1: Architecture & Contract Stub
+﻿"""
+pipeline/render.py — Phase 1 & 5: Video Rendering Stub & Contracts
 
 Contract:
   Inputs:  video.mp4, final_coords_916.json, final_coords_11.json
@@ -10,7 +10,7 @@ Filled in during Phase 5, Step 11:
   - Crop region per final_coords track, overlay centered.
   - Render with cv2.VideoWriter, then mux original audio via FFmpeg (-c:v copy -c:a aac).
 
-Supports --mock flag to generate valid test MP4 deliverables for testing Phase 1.
+Supports --mock flag to generate valid test MP4 deliverables for testing.
 """
 import argparse
 import sys
@@ -27,24 +27,20 @@ STAGE_NAME = "render"
 def generate_mock_rendered_videos(
     video_path: Path, coords_916: dict, coords_11: dict, out_916: Path, out_11: Path
 ) -> None:
-    """
-    Generate lightweight valid test video files for Phase 1 architectural testing.
-    Uses cv2.VideoWriter with basic test pattern.
-    """
+    """Generate lightweight valid test video files for testing."""
     import cv2
     import numpy as np
 
-    # Read duration/fps info from input video if possible
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 30.0
     if fps <= 0:
         fps = 30.0
     cap.release()
 
-    total_frames = 30  # 1-second lightweight mock for quick testing
+    total_frames = 30
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-    # Render 9:16 mock video (1080x1920 or 608x1080)
+    # Render 9:16 mock video (608x1080)
     out_916.parent.mkdir(parents=True, exist_ok=True)
     writer_916 = cv2.VideoWriter(str(out_916), fourcc, fps, (608, 1080))
     for i in range(total_frames):
@@ -79,7 +75,7 @@ def run(
         generate_mock_rendered_videos(video_path, coords_916, coords_11, out_916, out_11)
         return
     raise NotImplementedError(
-        "Phase 5, Step 11: per-frame crop + blurred-background composite via OpenCV & FFmpeg audio mux. (Use --mock for architecture testing)"
+        "Phase 5, Step 11: per-frame crop + blurred-background composite via OpenCV & FFmpeg audio mux. (Use --mock for testing)"
     )
 
 
