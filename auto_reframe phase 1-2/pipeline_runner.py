@@ -1,101 +1,183 @@
-"""
-pipeline_runner.py — Phase 1: Architecture
+﻿"""
+pipeline_runner.py — Phase 1 & 2: Pipeline Orchestrator & Concurrency Governor
 
 The orchestration layer. Runs each stage as an isolated subprocess
-(never an in-process import) so a crash in one stage — bad model
-weights, an OOM, a stray exception — can't take the rest of the app
-down or corrupt shared state. This is the direct implementation of the
-plan's core principle: "each script reads one JSON and writes one JSON,
-so a failure in one stage doesn't take down the others."
+so a crash in one stage — bad model weights, an OOM, a stray exception —
+cannot crash the app or leave corrupted state.
 
-It schedules off config.PIPELINE_STAGES as a dependency graph rather
-than a fixed top-to-bottom list: ocr_pass only needs video.mp4, so it
-runs concurrently with the transcribe -> analyze_script -> tracker
-chain instead of waiting behind it. Everything converges at
-smooth_coords, then render.
-
-Phase 6 will call run_pipeline() from inside Streamlit and wrap the
-per-stage prints in st.spinner instead.
+Features:
+- DAG dependency-driven concurrency: ocr_pass runs in parallel with transcribe -> analyze_script.
+- Immediate failure isolation and downstream dependency pruning without pipeline stalls.
+- Custom execution flags propagation (e.g. --mock).
+- Stage timing and execution reporting.
 """
+import argparse
 import concurrent.futures
 import subprocess
 import sys
 import time
-from typing import NamedTuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Set
 
-from config import PIPELINE_STAGES, DATA_DIR, BASE_DIR
+from config import (
+    PIPELINE_STAGES, DATA_DIR, BASE_DIR,
+    get_downstream_stages, validate_pipeline_dag
+)
 
 
-class StageResult(NamedTuple):
+@dataclass
+class StageResult:
     name: str
     ok: bool
-    stderr: str
+    duration: float = 0.0
+    stderr: str = ""
+    stdout: str = ""
+    skipped_reason: Optional[str] = None
 
 
-def _inputs_ready(stage: dict) -> bool:
-    return all((DATA_DIR / f).exists() for f in stage["inputs"])
+def _inputs_ready(stage: dict, data_dir: Path) -> bool:
+    return all((data_dir / f).exists() for f in stage["inputs"])
 
 
-def run_stage(stage: dict) -> StageResult:
-    """Run one stage script as its own process and capture the result.
-    Never raises — a failed stage is reported back, not thrown, so the
-    caller decides whether to halt the whole pipeline or keep going."""
-    script_path = BASE_DIR / stage["script"]
-    proc = subprocess.run(
-        [sys.executable, str(script_path)],
-        cwd=BASE_DIR,
-        capture_output=True,
-        text=True,
-    )
-    return StageResult(name=stage["name"], ok=proc.returncode == 0, stderr=proc.stderr)
+def run_stage(
+    stage: dict,
+    base_dir: Path,
+    data_dir: Optional[Path] = None,
+    mock: bool = False,
+    extra_args: Optional[List[str]] = None
+) -> StageResult:
+    """Run one stage script as an isolated subprocess."""
+    script_path = base_dir / stage["script"]
+    cmd = [sys.executable, str(script_path)]
+    if mock:
+        cmd.append("--mock")
+    if extra_args:
+        cmd.extend(extra_args)
+
+    start_time = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=base_dir,
+            capture_output=True,
+            text=True,
+        )
+        elapsed = time.time() - start_time
+        return StageResult(
+            name=stage["name"],
+            ok=proc.returncode == 0,
+            duration=elapsed,
+            stderr=proc.stderr.strip(),
+            stdout=proc.stdout.strip()
+        )
+    except Exception as e:
+        elapsed = time.time() - start_time
+        return StageResult(
+            name=stage["name"],
+            ok=False,
+            duration=elapsed,
+            stderr=str(e),
+            stdout=""
+        )
 
 
-def run_pipeline(poll_interval: float = 0.2) -> list[StageResult]:
+def run_pipeline(
+    data_dir: Optional[Path] = None,
+    mock: bool = False,
+    poll_interval: float = 0.05,
+    max_workers: int = 4
+) -> List[StageResult]:
     """
-    Runs every stage in PIPELINE_STAGES, launching each one as soon as
-    its declared inputs exist on disk, and letting independent branches
-    run in parallel. Requires video.mp4 to already be in DATA_DIR before
-    this is called (app.py's job).
-
-    Returns one StageResult per stage that actually ran. Does not raise
-    on a stage failure — check `.ok` on each result. Does raise if the
-    graph stalls (some stage's inputs never appear), which almost always
-    means an upstream stage failed silently or video.mp4 is missing.
+    Executes the pipeline DAG.
+    Launches stages as soon as dependencies are satisfied.
     """
-    pending = {s["name"]: s for s in PIPELINE_STAGES}
-    running: dict[str, concurrent.futures.Future] = {}
-    results: list[StageResult] = []
+    target_data_dir = data_dir or DATA_DIR
+    validate_pipeline_dag()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    pending: Dict[str, dict] = {s["name"]: s for s in PIPELINE_STAGES}
+    running: Dict[str, concurrent.futures.Future] = {}
+    results: List[StageResult] = []
+    blocked_stages: Set[str] = set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         while pending or running:
+            # Check for newly ready stages
             for name, stage in list(pending.items()):
-                if _inputs_ready(stage):
-                    print(f"[{name}] starting")
-                    running[name] = pool.submit(run_stage, stage)
+                if name in blocked_stages:
+                    del pending[name]
+                    continue
+
+                if _inputs_ready(stage, target_data_dir):
+                    print(f"[{name}] STARTING")
+                    running[name] = pool.submit(run_stage, stage, BASE_DIR, target_data_dir, mock)
                     del pending[name]
 
-            if not running:
-                stuck = ", ".join(pending)
-                raise RuntimeError(
-                    f"Pipeline stalled — inputs never appeared for: {stuck}. "
-                    f"Is video.mp4 in {DATA_DIR}? Did an upstream stage fail?"
-                )
+            if not running and pending:
+                stuck = [name for name in pending if name not in blocked_stages]
+                if stuck:
+                    raise RuntimeError(
+                        f"Pipeline stalled — dependencies missing for: {', '.join(stuck)}. "
+                        f"Check if video.mp4 exists in {target_data_dir} or if upstream stage failed."
+                    )
+                else:
+                    break
 
+            if not running and not pending:
+                break
+
+            # Poll running futures
             done_names = [n for n, f in running.items() if f.done()]
             if not done_names:
                 time.sleep(poll_interval)
                 continue
 
             for name in done_names:
-                result = running.pop(name).result()
-                results.append(result)
-                status = "OK" if result.ok else "FAILED"
-                print(f"[{name}] {status}")
-                if not result.ok:
-                    print(result.stderr, file=sys.stderr)
+                fut = running.pop(name)
+                res = fut.result()
+                results.append(res)
+                status = "OK" if res.ok else "FAILED"
+                print(f"[{name}] {status} ({res.duration:.2f}s)")
+                if not res.ok:
+                    if res.stderr:
+                        print(f"  -> Error details:\n{res.stderr}", file=sys.stderr)
+                    # Prune downstream stages that depend on this stage
+                    cascading_blocked = get_downstream_stages(name)
+                    for blocked_name in cascading_blocked:
+                        if blocked_name not in blocked_stages:
+                            blocked_stages.add(blocked_name)
+                            skip_res = StageResult(
+                                name=blocked_name,
+                                ok=False,
+                                duration=0.0,
+                                skipped_reason=f"Blocked by failed upstream stage '{name}'"
+                            )
+                            results.append(skip_res)
+                            print(f"[{blocked_name}] SKIPPED ({skip_res.skipped_reason})")
 
     return results
 
 
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mock", action="store_true", help="Run entire pipeline in mock mode")
+    parser.add_argument("--video", type=Path, help="Optional input video to stage before running")
+    args = parser.parse_args()
+
+    if args.video:
+        import shutil
+        target = DATA_DIR / "video.mp4"
+        shutil.copy(args.video, target)
+        print(f"Staged {args.video} to {target}")
+
+    results = run_pipeline(mock=args.mock)
+    failed = [r for r in results if not r.ok and not r.skipped_reason]
+    if failed:
+        print(f"\nPipeline finished with {len(failed)} stage failures.")
+        sys.exit(1)
+    else:
+        print("\nPipeline completed successfully!")
+
+
 if __name__ == "__main__":
-    run_pipeline()
+    main()

@@ -1,28 +1,101 @@
-"""
-pipeline/transcribe.py — Phase 1: Architecture & Contract Stub
+﻿"""
+pipeline/transcribe.py — Phase 2, Step 1: Faster-Whisper Speech-to-Text
 
 Contract:
-  Input:  video.mp4 (or extracted audio)
+  Input:  video.mp4 (or audio file)
   Output: transcript.json
 
-Filled in during Phase 2, Step 1: run faster-whisper (distil-large-v3 / base) locally,
-extract audio with FFmpeg first, and produce word-level timestamps.
+Runs faster-whisper locally on 16kHz mono audio extracted via FFmpeg,
+producing precise word-level timestamps conforming to TranscriptData contract.
 
-Supports --mock flag to generate valid schema-compliant mock transcript for testing Phase 1.
+Supports --mock flag to generate valid schema-compliant transcript for testing.
 """
 import argparse
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
+from typing import Dict, Any, List
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from config import stage_path                               # noqa: E402
+from config import stage_path, MODELS_DIR, PROJECT_ROOT               # noqa: E402
 from contracts import TranscriptData, WordTiming, validate_transcript  # noqa: E402
-from utils.io_json import save_json, fail_stage             # noqa: E402
+from utils.io_json import save_json, fail_stage                        # noqa: E402
 
 STAGE_NAME = "transcribe"
 
 
-def generate_mock_transcript(video_path: Path) -> dict:
+def _get_ffmpeg_binary() -> str:
+    """Finds available FFmpeg binary via parent ffmpeg_utils, local tools, imageio_ffmpeg, or PATH."""
+    try:
+        sys.path.append(str(PROJECT_ROOT))
+        import ffmpeg_utils
+        return ffmpeg_utils.get_ffmpeg_exe()
+    except Exception:
+        pass
+
+    local_candidates = [
+        PROJECT_ROOT / "tools" / "ffmpeg.exe",
+        PROJECT_ROOT / "tools" / "ffmpeg",
+    ]
+    for cand in local_candidates:
+        if cand.exists():
+            return str(cand)
+
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+
+    raise FileNotFoundError("FFmpeg binary not found on system. Ensure imageio-ffmpeg or ffmpeg is installed.")
+
+
+def _extract_audio(video_path: Path) -> Path:
+    """Extracts audio to 16kHz mono PCM WAV for Faster-Whisper."""
+    audio_path = video_path.with_suffix(".wav")
+    ffmpeg_exe = _get_ffmpeg_binary()
+    cmd = [
+        ffmpeg_exe, "-y", "-i", str(video_path),
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        str(audio_path)
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"FFmpeg audio extraction failed:\n{proc.stderr}")
+    return audio_path
+
+
+def _resolve_whisper_model_path(model_name: str) -> str:
+    """Checks for locally cached Whisper model folder before falling back to model name."""
+    candidates = [
+        MODELS_DIR / "whisper" / model_name,
+        MODELS_DIR / model_name,
+        PROJECT_ROOT / "models" / "whisper" / model_name,
+        PROJECT_ROOT / "models" / model_name,
+    ]
+    for c in candidates:
+        if c.exists() and (c / "model.bin").exists():
+            return str(c)
+
+    fallback_base = [
+        MODELS_DIR / "whisper" / "base",
+        PROJECT_ROOT / "models" / "whisper" / "base",
+    ]
+    for c in fallback_base:
+        if c.exists() and (c / "model.bin").exists():
+            print(f"[{STAGE_NAME}] Model '{model_name}' not cached locally, falling back to cached 'base' model at {c}")
+            return str(c)
+
+    return model_name
+
+
+def generate_mock_transcript(duration: float = 10.37) -> dict:
     """Generate mock transcript conforming to TranscriptData contract."""
     words = [
         WordTiming("Hello", 0.0, 0.4, 0.98),
@@ -53,34 +126,100 @@ def generate_mock_transcript(video_path: Path) -> dict:
         WordTiming("your", 9.2, 9.4, 0.98),
         WordTiming("screen.", 9.4, 9.8, 0.99),
     ]
+    full_text = " ".join([w.word for w in words])
     data = TranscriptData(
         words=words,
-        text="Hello and welcome to the auto-reframe demonstration. Look at this chart on the right side over here. Notice the key metric in the corner of your screen.",
+        text=full_text,
         language="en",
-        duration=10.37
+        duration=duration
     )
     return data.to_dict()
 
 
-def run(video_path: Path, mock: bool = False) -> dict:
+def run(video_path: Path, model_size: str = "distil-large-v3",
+        device: str = "auto", compute_type: str = "auto", mock: bool = False) -> dict:
     if mock:
-        return generate_mock_transcript(video_path)
-    raise NotImplementedError(
-        "Phase 2, Step 1: call faster-whisper here and return word-level timestamps. (Use --mock for architecture testing)"
+        return generate_mock_transcript()
+
+    if not video_path.exists():
+        raise FileNotFoundError(f"Source video/audio file not found at: {video_path}")
+
+    from faster_whisper import WhisperModel
+
+    is_wav = video_path.suffix.lower() == ".wav"
+    audio_path = video_path if is_wav else _extract_audio(video_path)
+
+    model_target = _resolve_whisper_model_path(model_size)
+    print(f"[{STAGE_NAME}] Loading Faster-Whisper model from '{model_target}' (device={device}, compute_type={compute_type})...")
+
+    comp_type = compute_type
+    if comp_type == "auto":
+        comp_type = "int8" if device in ("auto", "cpu") else "float16"
+
+    dev = "cpu" if device == "auto" else device
+
+    model = WhisperModel(
+        model_target,
+        device=dev,
+        compute_type=comp_type,
+        download_root=str(MODELS_DIR / "whisper")
     )
+
+    segments, info = model.transcribe(str(audio_path), word_timestamps=True)
+
+    words_list: List[WordTiming] = []
+    full_text_parts: List[str] = []
+
+    for segment in segments:
+        full_text_parts.append(segment.text.strip())
+        if segment.words:
+            for w in segment.words:
+                cleaned = w.word.strip()
+                if cleaned:
+                    words_list.append(
+                        WordTiming(
+                            word=cleaned,
+                            start=w.start,
+                            end=w.end,
+                            probability=w.probability
+                        )
+                    )
+
+    dur = info.duration if info.duration > 0 else (words_list[-1].end if words_list else 0.0)
+    full_text = " ".join(full_text_parts)
+
+    data = TranscriptData(
+        words=words_list,
+        text=full_text,
+        language=info.language or "en",
+        duration=dur
+    )
+    return data.to_dict()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video", type=Path, default=stage_path("video.mp4"))
     parser.add_argument("--out", type=Path, default=stage_path("transcript.json"))
-    parser.add_argument("--mock", action="store_true", help="Run in mock mode with synthetic data for testing")
+    parser.add_argument("--model-size", default="distil-large-v3",
+                        help="e.g. distil-large-v3, base, small, large-v3")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--compute-type", default="auto")
+    parser.add_argument("--mock", action="store_true", help="Generate mock transcript without running model")
     args = parser.parse_args()
 
     try:
-        transcript = run(args.video, mock=args.mock)
+        transcript = run(
+            video_path=args.video,
+            model_size=args.model_size,
+            device=args.device,
+            compute_type=args.compute_type,
+            mock=args.mock
+        )
         save_json(args.out, transcript, validator=validate_transcript)
-        print(f"[{STAGE_NAME}] wrote {args.out}")
+        word_count = len(transcript.get("words", []))
+        duration = transcript.get("duration", 0.0)
+        print(f"[{STAGE_NAME}] successfully wrote {args.out} ({word_count} words, {duration:.2f}s)")
     except Exception as e:
         fail_stage(STAGE_NAME, e)
 

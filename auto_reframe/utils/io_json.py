@@ -1,5 +1,5 @@
-"""
-utils/io_json.py — Phase 1: Architecture & Safe I/O
+﻿"""
+utils/io_json.py — Phase 1 & 2: Safe, Atomic JSON I/O & Schema Validation
 
 Standardized JSON reading/writing for every pipeline stage:
 1. Atomic writes via temporary files so crashed stages never leave corrupted JSON.
@@ -30,7 +30,6 @@ class SafeJSONEncoder(json.JSONEncoder):
     - Enums
     """
     def default(self, obj: Any) -> Any:
-        # Handle numpy types if numpy is installed
         try:
             import numpy as np
             if isinstance(obj, np.integer):

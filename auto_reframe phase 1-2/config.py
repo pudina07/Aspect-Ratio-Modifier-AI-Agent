@@ -1,78 +1,171 @@
-"""
-config.py — Phase 1: Architecture
+﻿"""
+config.py — Phase 1 & 2: Architecture & Pipeline Configuration
 
 Single source of truth for:
-  1. where files live (DATA_DIR holds every intermediate artifact for a run)
-  2. the stage/JSON contract graph from the plan's Phase 1 diagram
-
-Nothing here does real work. The point of this file is that no other
-script hardcodes a filename or a "what depends on what" assumption —
-they all read it from PIPELINE_STAGES. That's what lets pipeline_runner.py
-figure out which stages can run in parallel (see its docstring) and lets
-app.py stay dumb about pipeline internals.
+  1. Directory layout and model/asset paths.
+  2. Safe zones configuration loading.
+  3. The stage/JSON contract DAG graph.
+  4. DAG validation and dependency query helpers.
 """
+import json
 from pathlib import Path
+from typing import Dict, List, Optional, Any, Set
 
 # --- Directory layout ----------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"       # per-run working dir: video.mp4 in, everything else out
-MODELS_DIR = BASE_DIR / "models"   # local model weights (whisper / mediapipe / easyocr)
+PROJECT_ROOT = BASE_DIR.parent
+DATA_DIR = BASE_DIR / "data"          # Working dir for pipeline artifacts
 
-DATA_DIR.mkdir(exist_ok=True)
-MODELS_DIR.mkdir(exist_ok=True)
+# Check both project root and local models dir
+_root_models = PROJECT_ROOT / "models"
+_local_models = BASE_DIR / "models"
+MODELS_DIR = _root_models if _root_models.exists() else _local_models
+
+_root_safe_zones = PROJECT_ROOT / "safe_zones.json"
+_local_safe_zones = BASE_DIR / "safe_zones.json"
+SAFE_ZONES_PATH = _root_safe_zones if _root_safe_zones.exists() else _local_safe_zones
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def stage_path(filename: str) -> Path:
-    """Resolve an artifact filename to its path inside the run's data dir.
-    Every stage script should get its default in/out paths through this,
-    not by string-concatenating paths themselves."""
-    return DATA_DIR / filename
+def stage_path(filename: str, custom_dir: Optional[Path] = None) -> Path:
+    """Resolve an artifact filename to its path inside data/ or a custom directory."""
+    target_dir = custom_dir or DATA_DIR
+    return target_dir / filename
 
 
-# --- Pipeline stage / dependency graph ------------------------------------
-# "inputs"/"outputs" are filenames inside DATA_DIR. This is a DAG, not a
-# strict line: ocr_pass only needs video.mp4, so it has no dependency on
-# the transcribe -> analyze_script -> tracker chain and can run alongside
-# it. pipeline_runner.py schedules stages off this graph rather than
-# assuming top-to-bottom order.
-PIPELINE_STAGES = [
+def load_safe_zones(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load safe zones presets from safe_zones.json with robust fallback."""
+    sz_file = path or SAFE_ZONES_PATH
+    if sz_file.exists():
+        try:
+            with open(sz_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    return {
+        "platforms": {
+            "tiktok_916": {
+                "name": "TikTok",
+                "aspect_ratio": "9:16",
+                "canvas_width": 1080,
+                "canvas_height": 1920,
+                "margins": {"top": 130, "bottom": 380, "left": 60, "right": 170}
+            },
+            "instagram_reels_916": {
+                "name": "Instagram Reels",
+                "aspect_ratio": "9:16",
+                "canvas_width": 1080,
+                "canvas_height": 1920,
+                "margins": {"top": 220, "bottom": 410, "left": 30, "right": 110}
+            },
+            "instagram_feed_11": {
+                "name": "Instagram Feed",
+                "aspect_ratio": "1:1",
+                "canvas_width": 1080,
+                "canvas_height": 1080,
+                "margins": {"top": 20, "bottom": 90, "left": 20, "right": 20}
+            }
+        }
+    }
+
+
+# --- Pipeline stage / dependency DAG graph --------------------------------
+PIPELINE_STAGES: List[Dict[str, Any]] = [
     {
         "name": "transcribe",
         "script": "pipeline/transcribe.py",
         "inputs": ["video.mp4"],
         "outputs": ["transcript.json"],
+        "description": "Speech-to-text transcription with word-level timestamps"
     },
     {
         "name": "analyze_script",
         "script": "pipeline/analyze_script.py",
         "inputs": ["transcript.json"],
         "outputs": ["focus_timeline.json"],
+        "description": "LLM pointing/reference detection with debounced focus blocks"
     },
     {
         "name": "tracker",
         "script": "pipeline/tracker.py",
-        # needs focus_timeline so it knows which frames are "object" blocks
-        # (i.e. worth running pose+hand on) vs. plain speaker frames
         "inputs": ["video.mp4", "focus_timeline.json"],
         "outputs": ["raw_coords.json"],
+        "description": "Face tracking & pose/hand pointing vector extrapolation"
     },
     {
         "name": "ocr_pass",
         "script": "pipeline/ocr_pass.py",
-        # deliberately independent of the transcript/focus branch
         "inputs": ["video.mp4"],
         "outputs": ["text_regions.json"],
+        "description": "On-screen text detection for protected boundary zones"
     },
     {
         "name": "smooth_coords",
         "script": "pipeline/smooth_coords.py",
         "inputs": ["raw_coords.json", "text_regions.json", "focus_timeline.json"],
         "outputs": ["final_coords_916.json", "final_coords_11.json"],
+        "description": "Dual-aspect crop windowing with One Euro filter & text clamping"
     },
     {
         "name": "render",
         "script": "pipeline/render.py",
         "inputs": ["video.mp4", "final_coords_916.json", "final_coords_11.json"],
         "outputs": ["output_916.mp4", "output_11.mp4"],
+        "description": "Video rendering with blurred full-bleed composite & audio muxing"
     },
 ]
+
+
+def get_stage_by_name(name: str) -> Optional[Dict[str, Any]]:
+    """Return stage definition dict by name."""
+    for s in PIPELINE_STAGES:
+        if s["name"] == name:
+            return s
+    return None
+
+
+def get_downstream_stages(failed_stage_name: str) -> Set[str]:
+    """
+    Computes all downstream stages that transitively depend on the outputs
+    of failed_stage_name.
+    """
+    failed_stage = get_stage_by_name(failed_stage_name)
+    if not failed_stage:
+        return set()
+
+    unavailable_files = set(failed_stage["outputs"])
+    blocked_stages: Set[str] = set()
+
+    changed = True
+    while changed:
+        changed = False
+        for stage in PIPELINE_STAGES:
+            s_name = stage["name"]
+            if s_name not in blocked_stages and s_name != failed_stage_name:
+                if any(inp in unavailable_files for inp in stage["inputs"]):
+                    blocked_stages.add(s_name)
+                    unavailable_files.update(stage["outputs"])
+                    changed = True
+
+    return blocked_stages
+
+
+def validate_pipeline_dag() -> bool:
+    """
+    Validates that the pipeline definition is a valid DAG:
+    - Every required input (except external entry points like video.mp4) is produced by an upstream stage.
+    - No circular dependencies exist.
+    """
+    produced_files = {"video.mp4"}
+    for stage in PIPELINE_STAGES:
+        produced_files.update(stage["outputs"])
+
+    for stage in PIPELINE_STAGES:
+        for inp in stage["inputs"]:
+            if inp not in produced_files:
+                raise ValueError(f"Stage '{stage['name']}' requires '{inp}', which is never produced.")
+
+    return True
