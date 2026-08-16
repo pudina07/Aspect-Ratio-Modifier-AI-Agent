@@ -1,4 +1,4 @@
-﻿"""
+"""
 pipeline/analyze_script.py — Phase 2, Steps 2 & 3: LLM & Semantic Focus Timeline Analysis
 
 Contract:
@@ -87,66 +87,64 @@ def _call_openai_llm(transcript_text: str, model_name: str = DEFAULT_MODEL) -> L
 def _extract_heuristic_focus_blocks(transcript: dict) -> List[Dict[str, Any]]:
     """
     Intelligent NLP semantic cue extractor for offline / keyless execution.
-    Detects reference phrases and correlates them directly with word timestamp boundaries.
+    Detects reference phrases and correlates them directly with exact word timestamp boundaries.
     """
     words = transcript.get("words", [])
     if not words:
         return []
 
-    # Cue phrases indicating object attention
+    # Direct deictic cues indicating verbal pointing or attention redirection
     cues = [
-        (re.compile(r"\b(look\s+at|look\s+here|see\s+this|notice\s+the|here\s+is|check\s+out|watch\s+this)\b", re.IGNORECASE), "object", 0.95),
-        (re.compile(r"\b(chart|graph|metric|screen|slide|table|diagram|figure|corner)\b", re.IGNORECASE), "object", 0.90),
-        (re.compile(r"\b(on\s+the\s+right|to\s+the\s+right|right\s+side)\b", re.IGNORECASE), "right", 0.95),
-        (re.compile(r"\b(on\s+the\s+left|to\s+the\s+left|left\s+side)\b", re.IGNORECASE), "left", 0.95),
+        (re.compile(r"\b(look\s+at|look\s+here|see\s+this|see\s+right\s+here|notice\s+the|notice\s+this|here\s+is|check\s+out|watch\s+this|pay\s+close\s+attention|pointing\s+to)\b", re.IGNORECASE), "object", 0.95),
+    ]
+    directions = [
+        (re.compile(r"\b(on\s+the\s+right|to\s+the\s+right|right\s+side|right\s+here|on\s+my\s+right)\b", re.IGNORECASE), "right"),
+        (re.compile(r"\b(on\s+the\s+left|to\s+the\s+left|left\s+side|left\s+here|on\s+my\s+left)\b", re.IGNORECASE), "left"),
     ]
 
-    total_duration = transcript.get("duration", 0.0)
-    if not total_duration and words:
-        total_duration = words[-1].get("end", 10.0)
+    total_duration = float(transcript.get("duration", 0.0))
+    if total_duration <= 0 and words:
+        total_duration = float(words[-1].get("end", 10.0))
 
-    # Build sliding windows of words
+    # Map character offsets in reconstructed transcript to word indices
+    char_to_word: List[Tuple[int, int, int, dict]] = []
+    accum = 0
+    for idx, w in enumerate(words):
+        w_str = w.get("word", "").strip()
+        s_char = accum
+        e_char = accum + len(w_str)
+        char_to_word.append((s_char, e_char, idx, w))
+        accum = e_char + 1
+
+    full_reconstructed = " ".join(w.get("word", "").strip() for w in words)
     extracted_blocks: List[Dict[str, Any]] = []
-    num_words = len(words)
 
-    i = 0
-    while i < num_words:
-        # Check window of 4 to 8 words
-        window_end = min(i + 8, num_words)
-        window_words = words[i:window_end]
-        window_text = " ".join([w.get("word", "").strip() for w in window_words])
+    for cue_pat, kind, conf in cues:
+        for m in cue_pat.finditer(full_reconstructed):
+            s_char, e_char = m.start(), m.end()
+            matching_words = [cw for cw in char_to_word if cw[1] >= s_char and cw[0] <= e_char]
+            if matching_words:
+                first_w_idx = matching_words[0][2]
+                end_w_idx = min(len(words) - 1, first_w_idx + 8)
 
-        is_object = False
-        direction = "center"
-        confidence = 0.85
+                # Scan phrase window for directional modifier
+                sub_phrase = " ".join(w.get("word", "") for w in words[first_w_idx:end_w_idx + 1])
+                dir_hint = "center"
+                for dir_pat, dir_name in directions:
+                    if dir_pat.search(sub_phrase):
+                        dir_hint = dir_name
+                        break
 
-        for pattern, kind, conf in cues:
-            if pattern.search(window_text):
-                if kind == "object":
-                    is_object = True
-                    confidence = max(confidence, conf)
-                elif kind in ("right", "left"):
-                    direction = kind
-                    is_object = True
-                    confidence = max(confidence, conf)
+                start_t = max(0.0, float(words[first_w_idx].get("start", 0.0)) - 0.15)
+                end_t = min(total_duration, float(words[end_w_idx].get("end", start_t + 2.5)) + 0.3)
 
-        if is_object:
-            start_t = window_words[0].get("start", 0.0)
-            end_t = window_words[-1].get("end", start_t + 2.0)
-            # Add padding around the gesture/cue
-            start_t = max(0.0, start_t - 0.2)
-            end_t = min(total_duration, end_t + 0.8)
-
-            extracted_blocks.append({
-                "start": round(start_t, 3),
-                "end": round(end_t, 3),
-                "focus": "object",
-                "direction_hint": direction,
-                "confidence": round(confidence, 3)
-            })
-            i = window_end  # Skip ahead past this event
-        else:
-            i += 1
+                extracted_blocks.append({
+                    "start": round(start_t, 3),
+                    "end": round(end_t, 3),
+                    "focus": "object",
+                    "direction_hint": dir_hint,
+                    "confidence": round(conf, 3)
+                })
 
     return extracted_blocks
 

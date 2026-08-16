@@ -1,4 +1,4 @@
-﻿"""
+"""
 run_tests.py — Comprehensive Test Suite for Auto-Reframe (Phases 1, 2, and 3)
 
 Tests all Phase 1, 2, and 3 components:
@@ -65,6 +65,12 @@ from pipeline.ocr_pass import (
     generate_mock_text_regions,
     _iou, _union_box, _quad_to_box
 )
+from pipeline.smooth_coords import (
+    run as run_smooth_coords,
+    generate_mock_final_coords,
+    _crop_dims, _ease_in_out, _build_dense_target, _apply_text_protection
+)
+from utils.one_euro import OneEuroFilter
 
 
 def test_contracts():
@@ -285,8 +291,43 @@ def test_phase3_ocr_pass():
     print("  [PASS] EasyOCR geometry, IoU temporal tracking, and schema validation verified.")
 
 
+def test_phase4_smooth_coords_and_one_euro():
+    print("\n[TEST 8/10] Testing Phase 4 Dual-Aspect Coordinator, One Euro Filter & Text Clamping...")
+    # 1. One Euro Filter Jitter Reduction
+    filt = OneEuroFilter(t0=0.0, x0=100.0, min_cutoff=1.0, beta=0.3, d_cutoff=1.0)
+    samples = [filt(t=i / 30.0, x=100.0 + (1.5 if i % 2 == 0 else -1.5)) for i in range(30)]
+    assert abs(samples[-1] - 100.0) < 1.0, "One Euro Filter should stabilize steady noisy signal"
+
+    # 2. Crop Window Dims
+    w916, h916, ax916 = _crop_dims(1920, 1080, 9, 16)
+    w11, h11, ax11 = _crop_dims(1920, 1080, 1, 1)
+    assert (w916, h916, ax916) == (608, 1080, "x")
+    assert (w11, h11, ax11) == (1080, 1080, "x")
+
+    # 3. Smoothstep Easing
+    assert _ease_in_out(0.0) == 0.0
+    assert _ease_in_out(1.0) == 1.0
+    assert _ease_in_out(0.5) == 0.5
+
+    # 4. Mock & Live smooth_coords execution
+    mock_timeline = generate_mock_focus_timeline({"duration": 10.37})
+    mock_raw = generate_mock_raw_coords(Path("dummy.mp4"), mock_timeline)
+    mock_ocr = generate_mock_text_regions(Path("dummy.mp4"))
+
+    c916, c11 = run_smooth_coords(mock_raw, mock_ocr, mock_timeline, mock=False)
+    validate_final_coords(c916)
+    validate_final_coords(c11)
+
+    assert len(c916["frames"]) == len(mock_raw["frames"])
+    assert len(c11["frames"]) == len(mock_raw["frames"])
+    assert c916["target_width"] == 608
+    assert c11["target_width"] == 1080
+
+    print(f"  [PASS] One Euro smoothing, 9:16 ({w916}x{h916}) & 1:1 ({w11}x{h11}) dual tracks validated across {len(c916['frames'])} frames.")
+
+
 def test_failure_isolation():
-    print("\n[TEST 8/9] Testing Failure Isolation & Downstream Pruning...")
+    print("\n[TEST 9/10] Testing Failure Isolation & Downstream Pruning...")
     dummy_video = DATA_DIR / "video.mp4"
     with open(dummy_video, "wb") as f:
         f.write(b"mock_video_bytes")
@@ -300,7 +341,7 @@ def test_failure_isolation():
 
 
 def test_end_to_end_mock_pipeline():
-    print("\n[TEST 9/9] Testing End-to-End Pipeline Execution & Artifact Deliverables...")
+    print("\n[TEST 10/10] Testing End-to-End Pipeline Execution & Artifact Deliverables...")
     dummy_video = DATA_DIR / "video.mp4"
     with open(dummy_video, "wb") as f:
         f.write(b"mock_video_bytes")
@@ -328,7 +369,7 @@ def test_end_to_end_mock_pipeline():
 
 def main():
     print("=" * 65)
-    print("      CONTEXT-AWARE AUTO-REFRAME: PHASES 1, 2 & 3 TEST SUITE    ")
+    print("      CONTEXT-AWARE AUTO-REFRAME: PHASES 1, 2, 3 & 4 TEST SUITE    ")
     print("=" * 65)
 
     start_time = time.time()
@@ -340,6 +381,7 @@ def main():
         test_phase2_script_analysis_and_debouncing()
         test_phase3_tracker()
         test_phase3_ocr_pass()
+        test_phase4_smooth_coords_and_one_euro()
         test_failure_isolation()
         test_end_to_end_mock_pipeline()
     except Exception as e:
@@ -350,9 +392,10 @@ def main():
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 65)
-    print(f"🎉 ALL 9 PHASE 1, 2 & 3 TEST SUITES PASSED in {elapsed:.2f}s!")
+    print(f"🎉 ALL 10 PHASE 1, 2, 3 & 4 TEST SUITES PASSED in {elapsed:.2f}s!")
     print("=" * 65)
 
 
 if __name__ == "__main__":
     main()
+

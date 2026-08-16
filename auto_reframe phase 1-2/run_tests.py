@@ -1,7 +1,7 @@
-﻿"""
-run_tests.py — Comprehensive Test Suite for Auto-Reframe (Phases 1, 2, and 3)
+"""
+run_tests.py — Comprehensive Test Suite for Auto-Reframe (Phases 1, 2, 3, and 4)
 
-Tests all Phase 1, 2, and 3 components:
+Tests all Phase 1, 2, 3, and 4 components:
 1. Data contracts and schema validation.
 2. Safe atomic JSON I/O and NumPy data type serialization.
 3. DAG graph topology and safe-zone presets.
@@ -9,8 +9,9 @@ Tests all Phase 1, 2, and 3 components:
 5. Script analysis, NLP cue extraction, and debouncing (Phase 2 Steps 2-3).
 6. MediaPipe face, pose & pointing vector tracking (Phase 3 Steps 4-5).
 7. EasyOCR protected text regions and IoU linking (Phase 3 Step 6).
-8. Failure isolation and cascading downstream pruning.
-9. End-to-end pipeline execution and artifact delivery.
+8. Dual-aspect crop coordinator, One Euro filter & text clamping (Phase 4 Steps 7-10).
+9. Failure isolation and cascading downstream pruning.
+10. End-to-end pipeline execution and artifact delivery.
 """
 import os
 import sys
@@ -65,10 +66,16 @@ from pipeline.ocr_pass import (
     generate_mock_text_regions,
     _iou, _union_box, _quad_to_box
 )
+from pipeline.smooth_coords import (
+    run as run_smooth_coords,
+    generate_mock_final_coords,
+    _crop_dims, _ease_in_out, _build_dense_target, _apply_text_protection
+)
+from utils.one_euro import OneEuroFilter
 
 
 def test_contracts():
-    print("[TEST 1/9] Testing Data Contracts & Schema Validators...")
+    print("[TEST 1/10] Testing Data Contracts & Schema Validators...")
     # 1. Transcript
     words = [WordTiming(word="hello", start=0.0, end=0.5, confidence=0.99)]
     t = TranscriptData(words=words, text="hello", language="en", duration=0.5)
@@ -116,7 +123,7 @@ def test_contracts():
 
 
 def test_io_json():
-    print("\n[TEST 2/9] Testing Atomic JSON I/O & NumPy Serialization...")
+    print("\n[TEST 2/10] Testing Atomic JSON I/O & NumPy Serialization...")
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
 
@@ -162,7 +169,7 @@ def test_io_json():
 
 
 def test_config_and_dag():
-    print("\n[TEST 3/9] Testing Pipeline DAG & Safe Zones Configuration...")
+    print("\n[TEST 3/10] Testing Pipeline DAG & Safe Zones Configuration...")
     # 1. DAG validation
     assert validate_pipeline_dag() is True, "Pipeline DAG is invalid"
 
@@ -184,7 +191,7 @@ def test_config_and_dag():
 
 
 def test_phase2_transcription():
-    print("\n[TEST 4/9] Testing Phase 2 Faster-Whisper Speech-to-Text...")
+    print("\n[TEST 4/10] Testing Phase 2 Faster-Whisper Speech-to-Text...")
     mock_t = generate_mock_transcript(10.37)
     validate_transcript(mock_t)
     assert len(mock_t["words"]) > 0
@@ -208,7 +215,7 @@ def test_phase2_transcription():
 
 
 def test_phase2_script_analysis_and_debouncing():
-    print("\n[TEST 5/9] Testing Phase 2 Script Analysis & Debouncing...")
+    print("\n[TEST 5/10] Testing Phase 2 Script Analysis & Debouncing...")
     mock_t = generate_mock_transcript(10.37)
 
     # 1. NLP Heuristic Cue Detection
@@ -236,7 +243,7 @@ def test_phase2_script_analysis_and_debouncing():
 
 
 def test_phase3_tracker():
-    print("\n[TEST 6/9] Testing Phase 3 Tracker (MediaPipe Face, Pose & Ray Extrapolation)...")
+    print("\n[TEST 6/10] Testing Phase 3 Tracker (MediaPipe Face, Pose & Ray Extrapolation)...")
     # 1. Ray Box Exit Math
     exit_right = _ray_box_exit(origin=(960.0, 540.0), direction=(1.0, 0.0), width=1920.0, height=1080.0)
     assert exit_right[0] == 1920.0 and exit_right[1] == 540.0
@@ -267,7 +274,7 @@ def test_phase3_tracker():
 
 
 def test_phase3_ocr_pass():
-    print("\n[TEST 7/9] Testing Phase 3 EasyOCR (Text Regions & IoU Tracking)...")
+    print("\n[TEST 7/10] Testing Phase 3 EasyOCR (Text Regions & IoU Tracking)...")
     # 1. IoU & Union box math
     box_a = (100.0, 100.0, 200.0, 50.0)
     box_b = (120.0, 100.0, 200.0, 50.0)
@@ -285,8 +292,43 @@ def test_phase3_ocr_pass():
     print("  [PASS] EasyOCR geometry, IoU temporal tracking, and schema validation verified.")
 
 
+def test_phase4_smooth_coords_and_one_euro():
+    print("\n[TEST 8/10] Testing Phase 4 Dual-Aspect Coordinator, One Euro Filter & Text Clamping...")
+    # 1. One Euro Filter Jitter Reduction
+    filt = OneEuroFilter(t0=0.0, x0=100.0, min_cutoff=1.0, beta=0.3, d_cutoff=1.0)
+    samples = [filt(t=i / 30.0, x=100.0 + (1.5 if i % 2 == 0 else -1.5)) for i in range(30)]
+    assert abs(samples[-1] - 100.0) < 1.0, "One Euro Filter should stabilize steady noisy signal"
+
+    # 2. Crop Window Dims
+    w916, h916, ax916 = _crop_dims(1920, 1080, 9, 16)
+    w11, h11, ax11 = _crop_dims(1920, 1080, 1, 1)
+    assert (w916, h916, ax916) == (608, 1080, "x")
+    assert (w11, h11, ax11) == (1080, 1080, "x")
+
+    # 3. Smoothstep Easing
+    assert _ease_in_out(0.0) == 0.0
+    assert _ease_in_out(1.0) == 1.0
+    assert _ease_in_out(0.5) == 0.5
+
+    # 4. Mock & Live smooth_coords execution
+    mock_timeline = generate_mock_focus_timeline({"duration": 10.37})
+    mock_raw = generate_mock_raw_coords(Path("dummy.mp4"), mock_timeline)
+    mock_ocr = generate_mock_text_regions(Path("dummy.mp4"))
+
+    c916, c11 = run_smooth_coords(mock_raw, mock_ocr, mock_timeline, mock=False)
+    validate_final_coords(c916)
+    validate_final_coords(c11)
+
+    assert len(c916["frames"]) == len(mock_raw["frames"])
+    assert len(c11["frames"]) == len(mock_raw["frames"])
+    assert c916["target_width"] == 608
+    assert c11["target_width"] == 1080
+
+    print(f"  [PASS] One Euro smoothing, 9:16 ({w916}x{h916}) & 1:1 ({w11}x{h11}) dual tracks validated across {len(c916['frames'])} frames.")
+
+
 def test_failure_isolation():
-    print("\n[TEST 8/9] Testing Failure Isolation & Downstream Pruning...")
+    print("\n[TEST 9/10] Testing Failure Isolation & Downstream Pruning...")
     dummy_video = DATA_DIR / "video.mp4"
     with open(dummy_video, "wb") as f:
         f.write(b"mock_video_bytes")
@@ -300,7 +342,7 @@ def test_failure_isolation():
 
 
 def test_end_to_end_mock_pipeline():
-    print("\n[TEST 9/9] Testing End-to-End Pipeline Execution & Artifact Deliverables...")
+    print("\n[TEST 10/10] Testing End-to-End Pipeline Execution & Artifact Deliverables...")
     dummy_video = DATA_DIR / "video.mp4"
     with open(dummy_video, "wb") as f:
         f.write(b"mock_video_bytes")
@@ -328,7 +370,7 @@ def test_end_to_end_mock_pipeline():
 
 def main():
     print("=" * 65)
-    print("      CONTEXT-AWARE AUTO-REFRAME: PHASES 1, 2 & 3 TEST SUITE    ")
+    print("      CONTEXT-AWARE AUTO-REFRAME: PHASES 1, 2, 3 & 4 TEST SUITE    ")
     print("=" * 65)
 
     start_time = time.time()
@@ -340,6 +382,7 @@ def main():
         test_phase2_script_analysis_and_debouncing()
         test_phase3_tracker()
         test_phase3_ocr_pass()
+        test_phase4_smooth_coords_and_one_euro()
         test_failure_isolation()
         test_end_to_end_mock_pipeline()
     except Exception as e:
@@ -350,7 +393,7 @@ def main():
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 65)
-    print(f"🎉 ALL 9 PHASE 1, 2 & 3 TEST SUITES PASSED in {elapsed:.2f}s!")
+    print(f"🎉 ALL 10 PHASE 1, 2, 3 & 4 TEST SUITES PASSED in {elapsed:.2f}s!")
     print("=" * 65)
 
 

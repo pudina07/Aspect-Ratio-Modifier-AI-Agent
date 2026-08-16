@@ -1,337 +1,491 @@
 """
-pipeline/smooth_coords.py — Phase 4, Steps 7-10
+pipeline/smooth_coords.py — Phase 4, Steps 7-10: Dual-Aspect Coordinator & Adaptive Smoothing
 
-Contract:  raw_coords.json + text_regions.json + focus_timeline.json
-           ->  final_coords_916.json + final_coords_11.json
+Contract:
+  Inputs:  raw_coords.json, text_regions.json, focus_timeline.json
+  Outputs: final_coords_916.json, final_coords_11.json
 
-This is where the two deliverables (9:16 and 1:1) diverge from one
-shared source of truth (raw_coords.json). Each track is built through
-four layers, run in this order:
+This is where the two deliverables (9:16 and 1:1) diverge from one shared source
+of truth (raw_coords.json). Each track is constructed through four layers:
 
-  1. Dense target construction + gap easing (Steps 7 & 10 combined).
-     raw_coords.json is sparse by design — tracker.py's own docstring
-     says so explicitly: "Frames where nothing was computed are omitted
-     entirely — smooth_coords.py (Phase 4) interpolates/holds across the
-     gaps, same as it already has to for the sparse face samples." So
-     before anything else, every frame in the video needs a target
-     value. Gaps are filled by holding the last known value and easing
-     (cubic ease-in-out, Step 10) into the next known value over the
-     last ~15 frames before it arrives, instead of a hard jump. This is
-     also where the 1:1 track's face-priority fallback from Step 7
-     lives: if centering on a pointing target would push the most
-     recently seen face out of the crop window, the face wins.
-  2. One Euro Filter (Step 8) on top of that dense signal, to smooth out
-     the genuine per-frame jitter that comes from continuous landmark
-     tracking during 'object' blocks (tracker.py runs pose+hand on
-     *every* frame in those blocks, not sparsely) — with beta raised
-     during 'object' blocks (responsive) and lowered during 'speaker'
-     blocks (stable), per focus_timeline.json.
-  3. Protected-region clamp (Step 9) against text_regions.json: nudges
-     the crop, rate-limited so it can't itself reintroduce jitter,
-     toward including on-screen text that would otherwise be more than
-     half cut off. The nudge accumulates across the frames a caption is
-     on screen and decays back out once it's gone, rather than resetting
-     every frame.
-  4. Final bounds clamp to keep the crop box inside the source frame.
+  1. Dense target construction + gap easing (Steps 7 & 10 combined):
+     raw_coords.json can be sparse across non-object frames. Every frame in the video
+     receives a target value. Gaps are filled by holding the last known value and
+     easing (cubic smoothstep ease-in-out, Step 10) into the next known value over the
+     last ~15 frames before it arrives.
+     Step 7 Face-Priority Fallback: For the 1:1 track (and 9:16), if centering on a
+     pointing target would push the most recently seen face out of the crop window,
+     the face constraint wins to keep the speaker visible while leaning toward the target.
 
-Both tracks pan along whichever source axis has slack for their target
-aspect ratio (x for both 9:16 and 1:1 against this plan's 1920x1080
-source, matching the plan's 608x1080 / 1080x1080 windows) and use the
-full extent of the other axis, so Y is fixed rather than "mostly fixed"
-in the numbers this plan actually specifies.
+  2. One Euro Filter (Step 8):
+     Adaptive low-pass filter applied per-axis. Automatically switches beta:
+     higher beta (BETA_OBJECT = 1.6) during 'object' blocks for agile responsiveness,
+     and lower beta (BETA_SPEAKER = 0.3) during 'speaker' blocks for jitter-free stability.
+
+  3. Protected-Region Text Clamp (Step 9):
+     Evaluates active text bounding boxes from text_regions.json. If on-screen text
+     would be more than 50% cut off by the crop, applies a persistent, rate-limited
+     nudge (up to 8.0 px/frame) toward including it, smoothly decaying back to zero
+     once the text expires.
+
+  4. Final Bounds Clamping & Schema Delivery:
+     Strictly bounds the crop window within source video dimensions [0, source_w - crop_w]
+     and rounds to integer pixels, fulfilling FinalCoordsData contracts.
+
+Supports --mock flag for fast architectural testing.
 """
 import argparse
 import sys
 from pathlib import Path
+from typing import Dict, Any, List, Tuple, Optional, Set
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from config import stage_path                               # noqa: E402
-from utils.io_json import load_json, save_json, fail_stage  # noqa: E402
-from utils.one_euro import OneEuroFilter                    # noqa: E402
+from config import stage_path                                     # noqa: E402
+from contracts import (                                           # noqa: E402
+    FinalCoordsData, FinalFrameCoord,
+    validate_raw_coords, validate_text_regions, validate_focus_timeline, validate_final_coords
+)
+from utils.io_json import load_json, save_json, fail_stage        # noqa: E402
+from utils.one_euro import OneEuroFilter                          # noqa: E402
 
 STAGE_NAME = "smooth_coords"
 
-TRACKS = {"916": (9, 16), "11": (1, 1)}
+TRACKS = {
+    "9:16": (9, 16),
+    "1:1": (1, 1)
+}
 
 TRANSITION_EASE_FRAMES = 15        # Step 10: "ease-in-out curve over ~15 frames"
-MIN_CUTOFF = 1.0                   # One Euro Filter baseline cutoff
-BETA_SPEAKER = 0.3                 # lower beta = more smoothing during 'speaker' blocks
-BETA_OBJECT = 1.6                  # higher beta = more responsiveness during 'object' blocks
-D_CUTOFF = 1.0                     # standard One Euro derivative cutoff
+MIN_CUTOFF = 1.0                   # Step 8: One Euro Filter baseline cutoff
+BETA_SPEAKER = 0.3                 # Lower beta = heavy smoothing during 'speaker' blocks
+BETA_OBJECT = 1.6                  # Higher beta = agile responsiveness during 'object' blocks
+D_CUTOFF = 1.0                     # Standard One Euro derivative cutoff
 TEXT_COVERAGE_THRESHOLD = 0.5      # Step 9: "more than ~50% cut off" trigger
-MAX_TEXT_NUDGE_PX_PER_FRAME = 8.0  # rate limit so the Step 9 clamp can't itself add jitter
+MAX_TEXT_NUDGE_PX_PER_FRAME = 8.0  # Rate limit so the Step 9 clamp cannot induce jitter
 
 
-def _crop_dims(source_w: int, source_h: int, aspect_w: int, aspect_h: int) -> tuple[int, int, str]:
-    """Fit an (aspect_w:aspect_h) window inside (source_w, source_h),
-    using the full extent of whichever source dimension the target
-    aspect ratio has no slack on, and panning along the other. For this
-    plan's 1920x1080 source, both the 9:16 and 1:1 targets land on
-    height-fixed / x-panning (608x1080 and 1080x1080, Step 7) — the
-    branch below just generalizes it in case a future source isn't
-    16:9 landscape.
+def _crop_dims(source_w: int, source_h: int, aspect_w: int, aspect_h: int) -> Tuple[int, int, str]:
+    """
+    Fits an (aspect_w : aspect_h) crop window inside (source_w, source_h),
+    using the full extent of whichever source dimension has no slack, and panning along the other.
+    For standard 16:9 1920x1080 landscape video:
+      - 9:16 target -> 608x1080 (pan axis 'x', slack = 1312 px)
+      - 1:1 target  -> 1080x1080 (pan axis 'x', slack = 840 px)
     """
     if source_w * aspect_h >= source_h * aspect_w:
         crop_h = source_h
-        crop_w = min(source_w, round(crop_h * aspect_w / aspect_h))
+        crop_w = min(source_w, int(round(crop_h * aspect_w / aspect_h)))
         return crop_w, crop_h, "x"
     else:
         crop_w = source_w
-        crop_h = min(source_h, round(crop_w * aspect_h / aspect_w))
+        crop_h = min(source_h, int(round(crop_w * aspect_h / aspect_w)))
         return crop_w, crop_h, "y"
 
 
 def _ease_in_out(p: float) -> float:
-    """Cubic smoothstep. Step 10: replaces v1's linear transition ramp —
-    "linear pans read as mechanical; eased pans read as intentional
-    camera work." """
-    p = min(1.0, max(0.0, p))
+    """
+    Cubic smoothstep ease-in-out curve: S(p) = 3p^2 - 2p^3.
+    Step 10: Ensures natural human-like camera motion without mechanical linear jerks.
+    """
+    p = min(1.0, max(0.0, float(p)))
     return p * p * (3.0 - 2.0 * p)
 
 
-def _object_frame_mask(focus_timeline: dict, fps: float, frame_count: int) -> list[bool]:
-    """Per-frame bool: True inside an 'object' focus_timeline block. Same
-    seconds->frames conversion tracker.py's _object_frame_ranges does,
-    kept as an independent local copy rather than an import: each stage
-    is meant to stand alone per config.py's docstring (a failure in one
-    stage shouldn't take down the others), so this stage doesn't reach
-    into tracker.py's internals even though the logic is tiny and
-    duplicated."""
+def _object_frame_mask(focus_timeline: dict, fps: float, frame_count: int) -> List[bool]:
+    """
+    Constructs a per-frame boolean mask indicating whether frame is inside an 'object' focus block.
+    Supports both start/end and start_time/end_time key conventions.
+    """
     mask = [False] * frame_count
     for block in focus_timeline.get("blocks", []):
         if block.get("focus") != "object":
             continue
-        start_f = max(0, int(round(block["start_time"] * fps)))
-        end_f = min(frame_count - 1, int(round(block["end_time"] * fps)))
+        start_t = float(block.get("start", block.get("start_time", 0.0)))
+        end_t = float(block.get("end", block.get("end_time", start_t)))
+        start_f = max(0, int(round(start_t * fps)))
+        end_f = min(frame_count - 1, int(round(end_t * fps)))
         for f in range(start_f, end_f + 1):
             mask[f] = True
     return mask
 
 
-def _build_dense_target(raw_coords: dict, axis_index: int, crop_dim: float, source_dim: int) -> list[float]:
-    """Steps 7 & 10. Walk raw_coords' sparse, time-ordered frame entries,
-    turn each into a single target-coordinate keyframe along this track's
-    panning axis (pointing target takes priority over face when both are
-    present in the same entry, since that only happens inside an
-    'object' block where pose+hand ran), then fill the full dense
-    per-frame array by holding + easing across the gaps between
-    keyframes.
+def _build_dense_target(
+    raw_coords: dict,
+    axis_index: int,
+    crop_dim: float,
+    source_dim: int,
+    frame_count: int,
+    fps: float
+) -> List[float]:
     """
-    meta = raw_coords["meta"]
-    fps, frame_count = meta["fps"], meta["frame_count"]
+    Steps 7 & 10: Dense Target Construction & Smooth Transition Easing.
 
-    keyframes: list[tuple[int, float]] = []
+    1. Extracts keyframes from raw_coords.
+    2. Step 7 Fallback: If extrapolated_target would push last_face outside crop_dim,
+       clamps coordinate to keep face visible while leaning maximally toward target.
+    3. Step 10: Interpolates gaps by holding previous position and easing over the
+       final TRANSITION_EASE_FRAMES leading into the next target.
+    """
+    keyframes: List[Tuple[int, float]] = []
     last_face = None
-    for entry in raw_coords.get("frames", []):
+
+    frames_list = raw_coords.get("frames", [])
+    for entry in frames_list:
         face = entry.get("face_center")
-        if face is not None:
-            last_face = face[axis_index]
+        if face is not None and len(face) > axis_index:
+            last_face = float(face[axis_index])
 
         target_pt = entry.get("extrapolated_target")
-        if target_pt is not None:
-            val = target_pt[axis_index]
-            # Step 7's face-priority fallback (spelled out for the 1:1
-            # track in the plan, applied here to both): if centering on
-            # the pointing target would push the most recently seen face
-            # outside this crop window, keep the face in frame and let
-            # the object be partially cropped instead of splitting the
-            # difference and losing both. This naturally bites far more
-            # often on the narrower 1:1 crop than 9:16, matching the
-            # plan's rationale, without needing two separate code paths.
-            #
-            # Clamp toward the face's window rather than snapping val to
-            # last_face outright — a hard snap discards the pointing
-            # target entirely and reintroduces a jump-cut on borderline
-            # frames (target just barely outside the face's window), even
-            # though "partially cropped" means the crop should still lean
-            # toward the target as far as the face-visible constraint
-            # allows.
+        if target_pt is not None and len(target_pt) > axis_index:
+            val = float(target_pt[axis_index])
+            # Step 7 Fallback: Maintain speaker face within crop window bounds
             if last_face is not None:
-                lo, hi = last_face - crop_dim / 2.0, last_face + crop_dim / 2.0
+                lo = last_face - crop_dim / 2.0
+                hi = last_face + crop_dim / 2.0
                 val = min(max(val, lo), hi)
-        elif face is not None:
-            val = face[axis_index]
+        elif face is not None and len(face) > axis_index:
+            val = float(face[axis_index])
         else:
-            continue  # entry carried neither signal on this axis
+            continue
 
-        frame_idx = int(round(entry["t"] * fps))
-        frame_idx = min(max(frame_idx, 0), frame_count - 1)
-        keyframes.append((frame_idx, val))
+        f_idx = entry.get("frame_idx")
+        if f_idx is None:
+            f_idx = int(round(float(entry.get("t", 0.0)) * fps))
+        f_idx = min(max(int(f_idx), 0), frame_count - 1)
+        keyframes.append((f_idx, val))
 
     if not keyframes:
-        # No face or pointing data anywhere in the video — hold dead
-        # center rather than guessing.
+        # Fallback to source frame center
         return [source_dim / 2.0] * frame_count
 
     dense = [0.0] * frame_count
     first_idx, first_val = keyframes[0]
-    for f in range(0, first_idx + 1):
+    for f in range(0, min(first_idx + 1, frame_count)):
         dense[f] = first_val
 
     for (idx_a, val_a), (idx_b, val_b) in zip(keyframes, keyframes[1:]):
         gap = idx_b - idx_a
         if gap <= 0:
-            continue  # duplicate/out-of-order timestamp; keep the earlier value
+            continue
         ease_len = min(TRANSITION_EASE_FRAMES, gap)
         ease_start = idx_b - ease_len
-        for f in range(idx_a + 1, ease_start):
+        for f in range(idx_a + 1, min(ease_start, frame_count)):
             dense[f] = val_a
         for k in range(ease_len + 1):
             f = ease_start + k
-            progress = (k / ease_len) if ease_len else 1.0
-            dense[f] = val_a + (val_b - val_a) * _ease_in_out(progress)
+            if 0 <= f < frame_count:
+                progress = (k / ease_len) if ease_len > 0 else 1.0
+                dense[f] = val_a + (val_b - val_a) * _ease_in_out(progress)
 
     last_idx, last_val = keyframes[-1]
-    for f in range(last_idx, frame_count):
+    for f in range(max(0, last_idx), frame_count):
         dense[f] = last_val
 
     return dense
 
 
-def _smooth_with_one_euro(dense: list[float], fps: float, object_mask: list[bool]) -> list[float]:
-    """Step 8. Adaptive beta per frame: 'object' blocks get the higher,
-    more-responsive beta; everything else (including gaps we've already
-    eased) gets the lower, smoother one."""
+def _smooth_with_one_euro(dense: List[float], fps: float, object_mask: List[bool]) -> List[float]:
+    """
+    Step 8: One Euro Filter Smoothing with Contextual Adaptive Beta.
+    Applies lower beta (BETA_SPEAKER = 0.3) for stable speaker tracking and
+    higher beta (BETA_OBJECT = 1.6) during object pointing events.
+    """
     if not dense:
         return []
-    filt = OneEuroFilter(t0=0.0, x0=dense[0], min_cutoff=MIN_CUTOFF, beta=BETA_SPEAKER, d_cutoff=D_CUTOFF)
+    filt = OneEuroFilter(
+        t0=0.0,
+        x0=dense[0],
+        min_cutoff=MIN_CUTOFF,
+        beta=BETA_SPEAKER,
+        d_cutoff=D_CUTOFF
+    )
     out = [dense[0]]
     for i in range(1, len(dense)):
         t = i / fps
-        beta = BETA_OBJECT if (i < len(object_mask) and object_mask[i]) else BETA_SPEAKER
-        out.append(filt(t, dense[i], beta=beta))
+        is_obj = (i < len(object_mask) and object_mask[i])
+        current_beta = BETA_OBJECT if is_obj else BETA_SPEAKER
+        out.append(filt(t, dense[i], beta=current_beta))
     return out
 
 
 def _decay_toward_zero(value: float, rate: float) -> float:
-    if value > 0:
+    """Decays an offset value towards zero by up to rate per step."""
+    if value > 0.0:
         return max(0.0, value - rate)
-    if value < 0:
+    if value < 0.0:
         return min(0.0, value + rate)
     return 0.0
 
 
-def _apply_text_protection(centers: list[float], crop_dim: float, fps: float,
-                            text_regions: dict, axis_index: int) -> tuple[list[float], int]:
-    """Step 9. Maintains a persistent, rate-limited 'correction' offset
-    on top of the smoothed baseline rather than nudging fresh from the
-    baseline each frame — a caption on screen for two seconds needs the
-    correction to accumulate across those frames to actually reach it,
-    not repeat the same single-frame nudge every time. The correction
-    decays back to zero (also rate-limited) once nothing needs
-    protecting, so the crop returns to the plain smoothed track instead
-    of snapping back.
+def _apply_text_protection(
+    centers: List[float],
+    crop_dim: float,
+    fps: float,
+    text_regions: dict,
+    axis_index: int
+) -> Tuple[List[float], List[bool], int]:
     """
-    regions_sorted = sorted(text_regions.get("regions", []), key=lambda r: r["t_start"])
-    add_ptr = 0
-    active: list[dict] = []
-    unfixable_ids: set[int] = set()
+    Step 9: Protected-Region Text Clamping.
 
-    out = []
+    Maintains a persistent, rate-limited correction offset (capped at 8.0 px/frame)
+    to prevent on-screen text from being clipped by >50%.
+    Decays smoothly back to zero once the on-screen text disappears.
+    """
+    raw_regions = text_regions.get("regions", [])
+    regions_sorted = sorted(raw_regions, key=lambda r: float(r.get("t_start", 0.0)))
+    add_ptr = 0
+    active: List[dict] = []
+    unfixable_ids: Set[int] = set()
+
+    out_centers: List[float] = []
+    protected_flags: List[bool] = []
     correction = 0.0
+
     for i, base in enumerate(centers):
         t = i / fps
-        while add_ptr < len(regions_sorted) and regions_sorted[add_ptr]["t_start"] <= t:
+        while add_ptr < len(regions_sorted) and float(regions_sorted[add_ptr].get("t_start", 0.0)) <= t:
             active.append(regions_sorted[add_ptr])
             add_ptr += 1
-        active[:] = [r for r in active if r["t_end"] >= t]
+        active[:] = [r for r in active if float(r.get("t_end", 0.0)) >= t]
 
         center = base + correction
-        worst_region, worst_cov = None, 1.0
+        worst_region = None
+        worst_cov = 1.0
+
         for r in active:
-            r_lo = r["x"] if axis_index == 0 else r["y"]
-            r_len = r["w"] if axis_index == 0 else r["h"]
+            box = r.get("box")
+            if box is not None and len(box) == 4:
+                rx, ry, rw, rh = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+            else:
+                rx = float(r.get("x", 0.0))
+                ry = float(r.get("y", 0.0))
+                rw = float(r.get("w", 0.0))
+                rh = float(r.get("h", 0.0))
+
+            r_lo = rx if axis_index == 0 else ry
+            r_len = rw if axis_index == 0 else rh
             if r_len <= 0:
                 continue
             r_hi = r_lo + r_len
-            overlap = max(0.0, min(center + crop_dim / 2.0, r_hi) - max(center - crop_dim / 2.0, r_lo))
+            crop_lo = center - crop_dim / 2.0
+            crop_hi = center + crop_dim / 2.0
+
+            overlap = max(0.0, min(crop_hi, r_hi) - max(crop_lo, r_lo))
             cov = overlap / r_len
             if cov < worst_cov:
-                worst_cov, worst_region = cov, r
+                worst_cov = cov
+                worst_region = (r, r_lo, r_len)
 
+        is_protected_frame = False
         if worst_region is not None and worst_cov < TEXT_COVERAGE_THRESHOLD:
-            r_lo = worst_region["x"] if axis_index == 0 else worst_region["y"]
-            r_len = worst_region["w"] if axis_index == 0 else worst_region["h"]
+            r_dict, r_lo, r_len = worst_region
             r_center = r_lo + r_len / 2.0
-            desired = r_center - center
-            step = max(-MAX_TEXT_NUDGE_PX_PER_FRAME, min(MAX_TEXT_NUDGE_PX_PER_FRAME, desired))
+            desired_shift = r_center - center
+            step = max(-MAX_TEXT_NUDGE_PX_PER_FRAME, min(MAX_TEXT_NUDGE_PX_PER_FRAME, desired_shift))
             correction += step
+            is_protected_frame = True
+
             if r_len > crop_dim:
-                # Text is wider than the crop's aspect ratio allows —
-                # can't ever fully include it. Best-effort center on it
-                # anyway (still capped by the same rate limit above);
-                # just flag it as a known limitation rather than pretend.
-                unfixable_ids.add(id(worst_region))
+                unfixable_ids.add(id(r_dict))
         else:
+            if abs(correction) > 1e-4:
+                is_protected_frame = True
             correction = _decay_toward_zero(correction, MAX_TEXT_NUDGE_PX_PER_FRAME)
 
-        out.append(base + correction)
+        out_centers.append(base + correction)
+        protected_flags.append(is_protected_frame)
 
-    return out, len(unfixable_ids)
+    return out_centers, protected_flags, len(unfixable_ids)
 
 
-def _build_track(aspect_w: int, aspect_h: int, raw_coords: dict, text_regions: dict,
-                  focus_timeline: dict) -> dict:
-    meta = raw_coords["meta"]
-    source_w, source_h = meta["width"], meta["height"]
-    fps, frame_count = meta["fps"], meta["frame_count"]
+def _build_track(
+    aspect_label: str,
+    aspect_w: int,
+    aspect_h: int,
+    raw_coords: dict,
+    text_regions: dict,
+    focus_timeline: dict
+) -> Dict[str, Any]:
+    """Builds a smoothed, text-protected, schema-compliant crop coordinate track."""
+    fps = float(raw_coords.get("fps", raw_coords.get("meta", {}).get("fps", 30.0)))
+    source_w = int(raw_coords.get("width", raw_coords.get("meta", {}).get("width", 1920)))
+    source_h = int(raw_coords.get("height", raw_coords.get("meta", {}).get("height", 1080)))
+    frame_count = int(raw_coords.get(
+        "total_frames",
+        raw_coords.get("meta", {}).get("total_frames", len(raw_coords.get("frames", [])))
+    ))
+    if frame_count <= 0:
+        frame_count = len(raw_coords.get("frames", []))
+    if frame_count <= 0:
+        frame_count = 1
 
     crop_w, crop_h, pan_axis = _crop_dims(source_w, source_h, aspect_w, aspect_h)
     axis_index = 0 if pan_axis == "x" else 1
     source_dim = source_w if pan_axis == "x" else source_h
     crop_dim = crop_w if pan_axis == "x" else crop_h
 
-    dense = _build_dense_target(raw_coords, axis_index, crop_dim, source_dim)
+    # 1. Dense target construction + transition easing + 1:1 face fallback
+    dense = _build_dense_target(raw_coords, axis_index, float(crop_dim), source_dim, frame_count, fps)
 
+    # 2. Adaptive One Euro Filter smoothing
     object_mask = _object_frame_mask(focus_timeline, fps, frame_count)
     smoothed = _smooth_with_one_euro(dense, fps, object_mask)
 
-    protected, unfixable = _apply_text_protection(smoothed, crop_dim, fps, text_regions, axis_index)
+    # 3. Protected text clamping
+    protected_centers, protected_flags, unfixable_count = _apply_text_protection(
+        smoothed, float(crop_dim), fps, text_regions, axis_index
+    )
 
-    frames_out = []
-    for i, center in enumerate(protected):
+    # 4. Final bounds clamping & schema formatting
+    final_frames: List[FinalFrameCoord] = []
+    for i, center in enumerate(protected_centers):
+        t = round(i / fps, 3)
         origin = center - crop_dim / 2.0
-        origin = min(max(origin, 0.0), source_dim - crop_dim)
+        origin = min(max(origin, 0.0), float(source_dim - crop_dim))
+
         if pan_axis == "x":
-            crop_x, crop_y = origin, (source_h - crop_h) / 2.0
+            cx, cy = origin, (source_h - crop_h) / 2.0
         else:
-            crop_x, crop_y = (source_w - crop_w) / 2.0, origin
-        frames_out.append({
-            "t": round(i / fps, 3),
-            "crop_x": int(round(crop_x)),
-            "crop_y": int(round(crop_y)),
-        })
+            cx, cy = (source_w - crop_w) / 2.0, origin
 
-    if unfixable:
-        print(f"[{STAGE_NAME}] note: {unfixable} protected text region(s) wider than the "
-              f"{aspect_w}:{aspect_h} crop window on this track — covered best-effort, "
-              f"not fully fixable at this aspect ratio.", file=sys.stderr)
+        focus_type = "object" if (i < len(object_mask) and object_mask[i]) else "speaker"
+        is_prot = protected_flags[i] if i < len(protected_flags) else False
 
-    return {
-        "meta": {
-            "crop_width": crop_w, "crop_height": crop_h,
-            "source_width": source_w, "source_height": source_h,
-            "fps": fps, "frame_count": frame_count,
-        },
-        "frames": frames_out,
+        final_frames.append(
+            FinalFrameCoord(
+                frame_idx=i,
+                t=t,
+                crop_x=int(round(cx)),
+                crop_y=int(round(cy)),
+                crop_w=crop_w,
+                crop_h=crop_h,
+                focus=focus_type,
+                text_protected=is_prot
+            )
+        )
+
+    if unfixable_count > 0:
+        print(f"[{STAGE_NAME}] note: {unfixable_count} text region(s) wider than {aspect_label} "
+              f"crop window — covered best-effort.", file=sys.stderr)
+
+    result_data = FinalCoordsData(
+        aspect_ratio=aspect_label,  # type: ignore
+        target_width=crop_w,
+        target_height=crop_h,
+        source_width=source_w,
+        source_height=source_h,
+        fps=fps,
+        total_frames=frame_count,
+        frames=final_frames
+    )
+    res_dict = result_data.to_dict()
+
+    # Legacy metadata support
+    res_dict["meta"] = {
+        "crop_width": crop_w,
+        "crop_height": crop_h,
+        "source_width": source_w,
+        "source_height": source_h,
+        "fps": fps,
+        "frame_count": frame_count,
+        "unfixable_text_regions": unfixable_count
     }
+    return res_dict
 
 
-def run(raw_coords: dict, text_regions: dict, focus_timeline: dict) -> tuple[dict, dict]:
+def generate_mock_final_coords(
+    raw_coords: dict, text_regions: dict, focus_timeline: dict
+) -> Tuple[dict, dict]:
+    """Generate mock 9:16 and 1:1 smoothed coordinates conforming to FinalCoordsData contract."""
+    fps = float(raw_coords.get("fps", 30.0))
+    total_frames = int(raw_coords.get("total_frames", len(raw_coords.get("frames", [])) or 311))
+    src_w = int(raw_coords.get("width", 1920))
+    src_h = int(raw_coords.get("height", 1080))
+
+    crop_w_916, crop_h_916 = 608, 1080
+    crop_w_11, crop_h_11 = 1080, 1080
+
+    frames_916: List[FinalFrameCoord] = []
+    frames_11: List[FinalFrameCoord] = []
+
+    for i in range(total_frames):
+        t = round(i / fps, 3)
+        raw_f = raw_coords.get("frames", [])[i] if i < len(raw_coords.get("frames", [])) else {}
+        focus = raw_f.get("focus", "speaker")
+
+        if 3.5 <= t <= 6.8:
+            crop_x_916 = 1312
+            crop_x_11 = 840
+        else:
+            crop_x_916 = (src_w - crop_w_916) // 2
+            crop_x_11 = (src_w - crop_w_11) // 2
+
+        frames_916.append(FinalFrameCoord(
+            frame_idx=i,
+            t=t,
+            crop_x=crop_x_916,
+            crop_y=0,
+            crop_w=crop_w_916,
+            crop_h=crop_h_916,
+            focus=focus,
+            text_protected=(t >= 6.8)
+        ))
+
+        frames_11.append(FinalFrameCoord(
+            frame_idx=i,
+            t=t,
+            crop_x=crop_x_11,
+            crop_y=0,
+            crop_w=crop_w_11,
+            crop_h=crop_h_11,
+            focus=focus,
+            text_protected=(t >= 6.8)
+        ))
+
+    coords_916 = FinalCoordsData(
+        aspect_ratio="9:16",
+        target_width=crop_w_916,
+        target_height=crop_h_916,
+        source_width=src_w,
+        source_height=src_h,
+        fps=fps,
+        total_frames=total_frames,
+        frames=frames_916
+    ).to_dict()
+
+    coords_11 = FinalCoordsData(
+        aspect_ratio="1:1",
+        target_width=crop_w_11,
+        target_height=crop_h_11,
+        source_width=src_w,
+        source_height=src_h,
+        fps=fps,
+        total_frames=total_frames,
+        frames=frames_11
+    ).to_dict()
+
+    return coords_916, coords_11
+
+
+def run(
+    raw_coords: dict,
+    text_regions: dict,
+    focus_timeline: dict,
+    mock: bool = False
+) -> Tuple[dict, dict]:
     """
-    Returns (coords_916, coords_11), each shaped like:
-        {"meta": {"crop_width": 608, "crop_height": 1080,
-                  "source_width": 1920, "source_height": 1080,
-                  "fps": 30.0, "frame_count": 900},
-         "frames": [{"t": 4.13, "crop_x": 210, "crop_y": 0}, ...]}
-
-    One dense entry per source video frame — render.py (Phase 5) can
-    index straight off frame number without any further interpolation.
+    Executes Phase 4 Dual-Aspect Coordinator & Adaptive Smoothing.
+    Returns (coords_916, coords_11) conforming to FinalCoordsData contracts.
     """
-    aw, ah = TRACKS["916"]
-    coords_916 = _build_track(aw, ah, raw_coords, text_regions, focus_timeline)
-    aw, ah = TRACKS["11"]
-    coords_11 = _build_track(aw, ah, raw_coords, text_regions, focus_timeline)
+    if mock:
+        return generate_mock_final_coords(raw_coords, text_regions, focus_timeline)
+
+    aw_916, ah_916 = TRACKS["9:16"]
+    coords_916 = _build_track("9:16", aw_916, ah_916, raw_coords, text_regions, focus_timeline)
+
+    aw_11, ah_11 = TRACKS["1:1"]
+    coords_11 = _build_track("1:1", aw_11, ah_11, raw_coords, text_regions, focus_timeline)
+
     return coords_916, coords_11
 
 
@@ -342,20 +496,21 @@ def main():
     parser.add_argument("--focus-timeline", type=Path, default=stage_path("focus_timeline.json"))
     parser.add_argument("--out-916", type=Path, default=stage_path("final_coords_916.json"))
     parser.add_argument("--out-11", type=Path, default=stage_path("final_coords_11.json"))
+    parser.add_argument("--mock", action="store_true", help="Run in mock mode with synthetic data for testing")
     args = parser.parse_args()
 
     try:
-        raw_coords = load_json(args.raw_coords)
-        text_regions = load_json(args.text_regions)
-        focus_timeline = load_json(args.focus_timeline)
+        raw_coords = load_json(args.raw_coords, validator=validate_raw_coords)
+        text_regions = load_json(args.text_regions, validator=validate_text_regions)
+        focus_timeline = load_json(args.focus_timeline, validator=validate_focus_timeline)
 
-        coords_916, coords_11 = run(raw_coords, text_regions, focus_timeline)
+        coords_916, coords_11 = run(raw_coords, text_regions, focus_timeline, mock=args.mock)
 
-        save_json(args.out_916, coords_916)
-        save_json(args.out_11, coords_11)
-        print(f"[{STAGE_NAME}] wrote {args.out_916} "
-              f"({coords_916['meta']['crop_width']}x{coords_916['meta']['crop_height']}) and "
-              f"{args.out_11} ({coords_11['meta']['crop_width']}x{coords_11['meta']['crop_height']}), "
+        save_json(args.out_916, coords_916, validator=validate_final_coords)
+        save_json(args.out_11, coords_11, validator=validate_final_coords)
+        print(f"[{STAGE_NAME}] successfully wrote {args.out_916} "
+              f"({coords_916['target_width']}x{coords_916['target_height']}) and "
+              f"{args.out_11} ({coords_11['target_width']}x{coords_11['target_height']}), "
               f"{len(coords_916['frames'])} frames each")
     except Exception as e:
         fail_stage(STAGE_NAME, e)
