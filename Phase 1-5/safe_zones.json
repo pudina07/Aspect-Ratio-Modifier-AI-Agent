@@ -1,0 +1,125 @@
+{
+  "_note": "Editable safe-zone presets for platform UI-chrome QA overlays. Tuned to midpoints of published UI margins.",
+
+  "tiktok_9x16": {
+    "aspect": "916",
+    "aspect_ratio": "9:16",
+    "canvas_width": 1080,
+    "canvas_height": 1920,
+    "top_clear_px": 130,
+    "bottom_clear_px": 380,
+    "right_clear_px": 170,
+    "left_clear_px": 60,
+    "margins": {
+      "top": 130,
+      "bottom": 380,
+      "left": 60,
+      "right": 170
+    },
+    "description": "TikTok standard 9:16 portrait UI overlay."
+  },
+
+  "reels_9x16": {
+    "aspect": "916",
+    "aspect_ratio": "9:16",
+    "canvas_width": 1080,
+    "canvas_height": 1920,
+    "top_clear_px": 220,
+    "bottom_clear_px": 410,
+    "right_clear_px": 110,
+    "left_clear_px": 30,
+    "margins": {
+      "top": 220,
+      "bottom": 410,
+      "left": 30,
+      "right": 110
+    },
+    "description": "Instagram Reels 9:16 portrait UI overlay."
+  },
+
+  "feed_1x1": {
+    "aspect": "11",
+    "aspect_ratio": "1:1",
+    "canvas_width": 1080,
+    "canvas_height": 1080,
+    "top_clear_px": 20,
+    "bottom_clear_px": 90,
+    "right_clear_px": 20,
+    "left_clear_px": 20,
+    "margins": {
+      "top": 20,
+      "bottom": 90,
+      "left": 20,
+      "right": 20
+    },
+    "description": "Instagram Feed 1:1 square UI overlay."
+  },
+
+  "tiktok_916": {
+    "aspect": "916",
+    "aspect_ratio": "9:16",
+    "canvas_width": 1080,
+    "canvas_height": 1920,
+    "top_clear_px": 130,
+    "bottom_clear_px": 380,
+    "right_clear_px": 170,
+    "left_clear_px": 60,
+    "margins": {
+      "top": 130,
+      "bottom": 380,
+      "left": 60,
+      "right": 170
+    }
+  },
+
+  "instagram_reels_916": {
+    "aspect": "916",
+    "aspect_ratio": "9:16",
+    "canvas_width": 1080,
+    "canvas_height": 1920,
+    "top_clear_px": 220,
+    "bottom_clear_px": 410,
+    "right_clear_px": 110,
+    "left_clear_px": 30,
+    "margins": {
+      "top": 220,
+      "bottom": 410,
+      "left": 30,
+      "right": 110
+    }
+  },
+
+  "instagram_feed_11": {
+    "aspect": "11",
+    "aspect_ratio": "1:1",
+    "canvas_width": 1080,
+    "canvas_height": 1080,
+    "top_clear_px": 20,
+    "bottom_clear_px": 90,
+    "right_clear_px": 20,
+    "left_clear_px": 20,
+    "margins": {
+      "top": 20,
+      "bottom": 90,
+      "left": 20,
+      "right": 20
+    }
+  },
+
+  "youtube_shorts_916": {
+    "aspect": "916",
+    "aspect_ratio": "9:16",
+    "canvas_width": 1080,
+    "canvas_height": 1920,
+    "top_clear_px": 140,
+    "bottom_clear_px": 360,
+    "right_clear_px": 130,
+    "left_clear_px": 40,
+    "margins": {
+      "top": 140,
+      "bottom": 360,
+      "left": 40,
+      "right": 130
+    }
+  }
+}

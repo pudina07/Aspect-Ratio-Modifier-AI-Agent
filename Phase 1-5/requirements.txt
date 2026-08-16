@@ -1,0 +1,25 @@
+# Phase 0 setup — pin these, download models up front, not mid-demo.
+# Appended to as each phase's real dependencies land.
+
+# Phase 2 — Focus Timeline Generator
+faster-whisper>=1.0.3
+openai>=1.40.0
+
+# Phase 3 — Vision Tracking: Pose, Hands, Face, and Text
+mediapipe>=0.10.31
+easyocr
+# headless: nothing in this pipeline calls cv2.imshow or any other GUI
+# API, and non-headless opencv-python drags in a libGL dependency that
+# server/CI/sandboxed environments often don't have.
+opencv-python-headless
+numpy
+
+# Phase 4 — Dual-Aspect Coordinator & Smoothing: no new packages
+# (utils/one_euro.py is a ~30-line dependency-free implementation).
+
+# Phase 5 — Platform-Aware Rendering: no new packages either — reuses
+# opencv-python-headless above. Also requires the `ffmpeg` CLI on PATH
+# (already a Phase 2 requirement for transcribe.py's audio extraction).
+
+# Phase 6 — not needed yet, listed here per the plan's Phase 0 checklist:
+# streamlit

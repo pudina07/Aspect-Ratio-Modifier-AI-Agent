@@ -39,10 +39,17 @@ tools/*.dylib
 # Intermediate / Generated Pipeline Outputs in data directories
 auto_reframe/data/*.mp4
 auto_reframe/data/*.json
+auto_reframe/data/*.wav
 !auto_reframe/data/.gitkeep
 auto_reframe phase 1-2/data/*.mp4
 auto_reframe phase 1-2/data/*.json
+auto_reframe phase 1-2/data/*.wav
 !auto_reframe phase 1-2/data/.gitkeep
+Phase 1-5/data/*.mp4
+Phase 1-5/data/*.json
+Phase 1-5/data/*.wav
+!Phase 1-5/data/.gitkeep
+Test_Video.wav
 
 # External cloned agency agents repo (compiled into .agents/ and AGENTS.md)
 agency-agents/
