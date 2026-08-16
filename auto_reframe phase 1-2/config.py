@@ -1,4 +1,4 @@
-﻿"""
+"""
 config.py — Phase 1 & 2: Architecture & Pipeline Configuration
 
 Single source of truth for:
@@ -10,11 +10,13 @@ Single source of truth for:
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
+import os
 
 # --- Directory layout ----------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-DATA_DIR = BASE_DIR / "data"          # Working dir for pipeline artifacts
+custom_env_data_dir = os.environ.get("AUTO_REFRAME_DATA_DIR")
+DATA_DIR = Path(custom_env_data_dir) if custom_env_data_dir else BASE_DIR / "data"
 
 # Check both project root and local models dir
 _root_models = PROJECT_ROOT / "models"

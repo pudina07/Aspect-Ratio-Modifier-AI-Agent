@@ -2,7 +2,7 @@
 utils/io_json.py — Phase 1 & 2: Safe, Atomic JSON I/O & Schema Validation
 
 Standardized JSON reading/writing for every pipeline stage:
-1. Atomic writes via temporary files so crashed stages never leave corrupted JSON.
+1. Atomic writes via temporary files with Windows lock retry and fallback so crashed stages never leave corrupted JSON.
 2. Custom JSON encoder supporting NumPy data types (np.float32, np.int64, ndarray),
    Path objects, and dataclasses.
 3. Explicit validation hooks against contracts.py.
@@ -10,7 +10,10 @@ Standardized JSON reading/writing for every pipeline stage:
 """
 import dataclasses
 import json
+import os
+import shutil
 import sys
+import time
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -57,6 +60,7 @@ def load_json(path: Path, validator: Optional[Callable[[Any], None]] = None) -> 
     Safely load and optionally validate a JSON file.
     Raises StageIOError on missing files, malformed JSON, or schema validation failures.
     """
+    path = Path(path)
     if not path.exists():
         raise StageIOError(
             f"Missing required input '{path.name}'. "
@@ -84,6 +88,7 @@ def save_json(path: Path, data: Any, validator: Optional[Callable[[Any], None]] 
     Atomically save JSON data using SafeJSONEncoder.
     Creates parent directories if needed and writes to a .tmp file before renaming.
     Optionally validates against a schema function prior to writing.
+    Includes Windows file-lock retry backoff and copy fallback.
     """
     if validator is not None:
         try:
@@ -93,12 +98,30 @@ def save_json(path: Path, data: Any, validator: Optional[Callable[[Any], None]] 
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
 
     try:
         with tmp_path.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, cls=SafeJSONEncoder)
-        tmp_path.replace(path)
+
+        renamed = False
+        last_err = None
+        for attempt in range(5):
+            try:
+                tmp_path.replace(path)
+                renamed = True
+                break
+            except (PermissionError, OSError) as pe:
+                last_err = pe
+                time.sleep(0.05 * (attempt + 1))
+
+        if not renamed:
+            shutil.copyfile(str(tmp_path), str(path))
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
     except Exception as e:
         if tmp_path.exists():
             try:

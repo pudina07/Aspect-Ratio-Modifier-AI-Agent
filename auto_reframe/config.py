@@ -11,10 +11,13 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
 
+import os
+
 # --- Directory layout ----------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-DATA_DIR = BASE_DIR / "data"          # Working dir for pipeline artifacts
+custom_env_data_dir = os.environ.get("AUTO_REFRAME_DATA_DIR")
+DATA_DIR = Path(custom_env_data_dir) if custom_env_data_dir else BASE_DIR / "data"
 MODELS_DIR = PROJECT_ROOT / "models"  # Preloaded model weights (from Phase 0)
 SAFE_ZONES_PATH = PROJECT_ROOT / "safe_zones.json"
 

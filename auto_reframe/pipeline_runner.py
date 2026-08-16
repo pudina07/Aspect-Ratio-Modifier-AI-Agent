@@ -1,4 +1,4 @@
-﻿"""
+"""
 pipeline_runner.py — Phase 1 & 2: Pipeline Orchestrator & Concurrency Governor
 
 The orchestration layer. Runs each stage as an isolated subprocess
@@ -13,6 +13,7 @@ Features:
 """
 import argparse
 import concurrent.futures
+import os
 import subprocess
 import sys
 import time
@@ -55,11 +56,16 @@ def run_stage(
     if extra_args:
         cmd.extend(extra_args)
 
+    env = os.environ.copy()
+    if data_dir:
+        env["AUTO_REFRAME_DATA_DIR"] = str(data_dir)
+
     start_time = time.time()
     try:
         proc = subprocess.run(
             cmd,
             cwd=base_dir,
+            env=env,
             capture_output=True,
             text=True,
         )
