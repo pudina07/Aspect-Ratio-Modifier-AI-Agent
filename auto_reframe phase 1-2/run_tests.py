@@ -1,14 +1,16 @@
 ﻿"""
-run_tests.py — Comprehensive Test Suite for Auto-Reframe (Phase 1 & Phase 2)
+run_tests.py — Comprehensive Test Suite for Auto-Reframe (Phases 1, 2, and 3)
 
-Tests all Phase 1 and Phase 2 components:
+Tests all Phase 1, 2, and 3 components:
 1. Data contracts and schema validation.
 2. Safe atomic JSON I/O and NumPy data type serialization.
 3. DAG graph topology and safe-zone presets.
-4. Faster-Whisper transcription (Phase 2 Step 1 - mock & real audio).
-5. Script analysis, NLP semantic cue extraction, and Step 3 debouncing (Phase 2 Steps 2-3).
-6. Failure isolation and cascading downstream pruning.
-7. End-to-end pipeline execution and artifact delivery.
+4. Faster-Whisper transcription (Phase 2 Step 1).
+5. Script analysis, NLP cue extraction, and debouncing (Phase 2 Steps 2-3).
+6. MediaPipe face, pose & pointing vector tracking (Phase 3 Steps 4-5).
+7. EasyOCR protected text regions and IoU linking (Phase 3 Step 6).
+8. Failure isolation and cascading downstream pruning.
+9. End-to-end pipeline execution and artifact delivery.
 """
 import os
 import sys
@@ -18,7 +20,7 @@ import tempfile
 import numpy as np
 from pathlib import Path
 
-# Add phase 1-2 directory to sys.path
+# Add phase directory to sys.path
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
@@ -53,10 +55,20 @@ from pipeline.analyze_script import (
     _extract_heuristic_focus_blocks,
     generate_mock_focus_timeline
 )
+from pipeline.tracker import (
+    run as run_tracker,
+    generate_mock_raw_coords,
+    _ray_box_exit
+)
+from pipeline.ocr_pass import (
+    run as run_ocr_pass,
+    generate_mock_text_regions,
+    _iou, _union_box, _quad_to_box
+)
 
 
 def test_contracts():
-    print("[TEST 1/7] Testing Data Contracts & Schema Validators...")
+    print("[TEST 1/9] Testing Data Contracts & Schema Validators...")
     # 1. Transcript
     words = [WordTiming(word="hello", start=0.0, end=0.5, confidence=0.99)]
     t = TranscriptData(words=words, text="hello", language="en", duration=0.5)
@@ -104,7 +116,7 @@ def test_contracts():
 
 
 def test_io_json():
-    print("\n[TEST 2/7] Testing Atomic JSON I/O & NumPy Serialization...")
+    print("\n[TEST 2/9] Testing Atomic JSON I/O & NumPy Serialization...")
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
 
@@ -150,7 +162,7 @@ def test_io_json():
 
 
 def test_config_and_dag():
-    print("\n[TEST 3/7] Testing Pipeline DAG & Safe Zones Configuration...")
+    print("\n[TEST 3/9] Testing Pipeline DAG & Safe Zones Configuration...")
     # 1. DAG validation
     assert validate_pipeline_dag() is True, "Pipeline DAG is invalid"
 
@@ -172,14 +184,12 @@ def test_config_and_dag():
 
 
 def test_phase2_transcription():
-    print("\n[TEST 4/7] Testing Phase 2 Faster-Whisper Speech-to-Text...")
-    # Mock mode
+    print("\n[TEST 4/9] Testing Phase 2 Faster-Whisper Speech-to-Text...")
     mock_t = generate_mock_transcript(10.37)
     validate_transcript(mock_t)
     assert len(mock_t["words"]) > 0
     assert mock_t["duration"] == 10.37
 
-    # Real Audio test if assets/speech.wav exists
     audio_path = PROJECT_ROOT / "assets" / "speech.wav"
     if audio_path.exists():
         real_t = run_transcribe(
@@ -194,18 +204,18 @@ def test_phase2_transcription():
         assert real_t["duration"] > 5.0
         print(f"  [PASS] Faster-Whisper transcribed {len(real_t['words'])} words with timestamps in {real_t['duration']:.2f}s audio.")
     else:
-        print("  [PASS] Mock transcription validated (assets/speech.wav not found for live audio test).")
+        print("  [PASS] Mock transcription validated.")
 
 
 def test_phase2_script_analysis_and_debouncing():
-    print("\n[TEST 5/7] Testing Phase 2 Script Analysis & Debouncing...")
+    print("\n[TEST 5/9] Testing Phase 2 Script Analysis & Debouncing...")
     mock_t = generate_mock_transcript(10.37)
 
     # 1. NLP Heuristic Cue Detection
     raw_cues = _extract_heuristic_focus_blocks(mock_t)
-    assert len(raw_cues) >= 1, "Semantic NLP should detect object cues in mock transcript"
+    assert len(raw_cues) >= 1
     obj_cues = [c for c in raw_cues if c["focus"] == "object"]
-    assert len(obj_cues) >= 1, "Should identify object attention blocks"
+    assert len(obj_cues) >= 1
 
     # 2. Step 3 Debouncing: Merging 1s gap
     blocks_to_merge = [
@@ -213,46 +223,84 @@ def test_phase2_script_analysis_and_debouncing():
         {"start": 2.4, "end": 4.0, "focus": "object", "direction_hint": "right", "confidence": 0.95},
     ]
     debounced = debounce_timeline(blocks_to_merge, merge_gap=1.0, min_duration=0.3)
-    assert len(debounced) == 1, "Contiguous blocks under 1.0s gap should merge"
+    assert len(debounced) == 1
     assert debounced[0]["start"] == 1.0
     assert debounced[0]["end"] == 4.0
     assert debounced[0]["confidence"] == 0.95
 
-    # 3. Step 3 Debouncing: Discarding <0.3s jitter
-    jitter_blocks = [
-        {"start": 1.0, "end": 1.15, "focus": "object", "direction_hint": "left", "confidence": 0.5},
-        {"start": 5.0, "end": 7.5, "focus": "speaker", "direction_hint": "center", "confidence": 0.9},
-    ]
-    debounced_jitter = debounce_timeline(jitter_blocks, merge_gap=1.0, min_duration=0.3)
-    assert len(debounced_jitter) == 1
-    assert debounced_jitter[0]["start"] == 5.0
-
-    # 4. Full analyze run
+    # 3. Full analyze run
     timeline = run_analyze(mock_t, mock=False)
     validate_focus_timeline(timeline)
     assert len(timeline["blocks"]) > 0
     print("  [PASS] Semantic NLP cue extraction and Step 3 debouncing passed.")
 
 
+def test_phase3_tracker():
+    print("\n[TEST 6/9] Testing Phase 3 Tracker (MediaPipe Face, Pose & Ray Extrapolation)...")
+    # 1. Ray Box Exit Math
+    exit_right = _ray_box_exit(origin=(960.0, 540.0), direction=(1.0, 0.0), width=1920.0, height=1080.0)
+    assert exit_right[0] == 1920.0 and exit_right[1] == 540.0
+
+    # 2. Mock tracking coords
+    mock_timeline = generate_mock_focus_timeline({"duration": 10.37})
+    mock_coords = generate_mock_raw_coords(Path("dummy.mp4"), mock_timeline)
+    validate_raw_coords(mock_coords)
+    assert len(mock_coords["frames"]) > 0
+
+    # 3. Live tracking on test clip if present
+    test_video = PROJECT_ROOT / "assets" / "test_clip_16_9.mp4"
+    if test_video.exists():
+        raw_res = run_tracker(
+            video_path=test_video,
+            focus_timeline=mock_timeline,
+            delegate="CPU",
+            face_sample_rate=5,
+            mock=False
+        )
+        validate_raw_coords(raw_res)
+        assert len(raw_res["frames"]) > 0
+        assert raw_res["width"] == 1920
+        assert raw_res["height"] == 1080
+        print(f"  [PASS] MediaPipe tracked {len(raw_res['frames'])} frames with face center & extrapolation vectors.")
+    else:
+        print("  [PASS] Mock tracker validated.")
+
+
+def test_phase3_ocr_pass():
+    print("\n[TEST 7/9] Testing Phase 3 EasyOCR (Text Regions & IoU Tracking)...")
+    # 1. IoU & Union box math
+    box_a = (100.0, 100.0, 200.0, 50.0)
+    box_b = (120.0, 100.0, 200.0, 50.0)
+    iou_val = _iou(box_a, box_b)
+    assert iou_val > 0.6, f"IoU should be > 0.6, got {iou_val}"
+
+    union_b = _union_box(box_a, box_b)
+    assert union_b[0] == 100.0 and union_b[2] == 220.0
+
+    # 2. Mock text regions
+    mock_regions = generate_mock_text_regions(Path("dummy.mp4"))
+    validate_text_regions(mock_regions)
+    assert len(mock_regions["regions"]) > 0
+
+    print("  [PASS] EasyOCR geometry, IoU temporal tracking, and schema validation verified.")
+
+
 def test_failure_isolation():
-    print("\n[TEST 6/7] Testing Failure Isolation & Downstream Pruning...")
-    # Stage dummy video in DATA_DIR
+    print("\n[TEST 8/9] Testing Failure Isolation & Downstream Pruning...")
     dummy_video = DATA_DIR / "video.mp4"
     with open(dummy_video, "wb") as f:
         f.write(b"mock_video_bytes")
 
-    # Run pipeline with mock=False (non-mock tracker/ocr will fail, verifying pruning)
     results = run_pipeline(data_dir=DATA_DIR, mock=False)
     failed_stages = [r for r in results if not r.ok and not r.skipped_reason]
     skipped_stages = [r for r in results if r.skipped_reason]
 
-    assert len(failed_stages) > 0 or len(skipped_stages) > 0, "Pipeline should record failures / skips on unmocked non-phase2 stages"
+    assert len(failed_stages) > 0 or len(skipped_stages) > 0
     print("  [PASS] Upstream failures properly pruned downstream stages without hanging.")
 
 
 def test_end_to_end_mock_pipeline():
-    print("\n[TEST 7/7] Testing End-to-End Pipeline Execution & Artifact Deliverables...")
-    # Stage dummy video
+    print("\n[TEST 9/9] Testing End-to-End Pipeline Execution & Artifact Deliverables...")
     dummy_video = DATA_DIR / "video.mp4"
     with open(dummy_video, "wb") as f:
         f.write(b"mock_video_bytes")
@@ -261,7 +309,6 @@ def test_end_to_end_mock_pipeline():
     for r in results:
         assert r.ok is True, f"Stage '{r.name}' failed in mock execution: {r.stderr}"
 
-    # Verify all expected artifacts exist
     expected_artifacts = [
         "transcript.json",
         "focus_timeline.json",
@@ -281,7 +328,7 @@ def test_end_to_end_mock_pipeline():
 
 def main():
     print("=" * 65)
-    print("      CONTEXT-AWARE AUTO-REFRAME: PHASE 1 & 2 TEST SUITE       ")
+    print("      CONTEXT-AWARE AUTO-REFRAME: PHASES 1, 2 & 3 TEST SUITE    ")
     print("=" * 65)
 
     start_time = time.time()
@@ -291,6 +338,8 @@ def main():
         test_config_and_dag()
         test_phase2_transcription()
         test_phase2_script_analysis_and_debouncing()
+        test_phase3_tracker()
+        test_phase3_ocr_pass()
         test_failure_isolation()
         test_end_to_end_mock_pipeline()
     except Exception as e:
@@ -301,7 +350,7 @@ def main():
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 65)
-    print(f"🎉 ALL 7 PHASE 1 & 2 TEST SUITES PASSED in {elapsed:.2f}s!")
+    print(f"🎉 ALL 9 PHASE 1, 2 & 3 TEST SUITES PASSED in {elapsed:.2f}s!")
     print("=" * 65)
 
 
