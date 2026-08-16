@@ -1,0 +1,12 @@
+# Phase 0 setup — pin these, download models up front, not mid-demo.
+# Appended to as each phase's real dependencies land.
+
+# Phase 2 — Focus Timeline Generator
+faster-whisper>=1.0.3
+openai>=1.40.0
+
+# Phase 3, 4, 5, 6 — not needed yet, listed here per the plan's Phase 0 checklist:
+# mediapipe>=0.10.31
+# easyocr
+# opencv-python
+# streamlit

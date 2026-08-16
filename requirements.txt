@@ -1,0 +1,13 @@
+# Core Pipeline Dependencies for Context-Aware Auto-Reframe (Phase 0 Pinned Versions)
+faster-whisper==1.2.1
+mediapipe>=0.10.31,<=1.0.1
+easyocr==1.7.2
+opencv-python>=4.10.0
+streamlit>=1.40.0,<=1.61.1
+torch>=2.4.0
+torchvision>=0.19.0
+imageio-ffmpeg==0.6.0
+numpy>=1.26.0
+ctranslate2>=4.0.0
+requests>=2.31.0
+tqdm>=4.66.0

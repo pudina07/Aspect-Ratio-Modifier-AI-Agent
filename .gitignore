@@ -1,0 +1,59 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Large AI Model Weights (Preloaded via download_models.py)
+models/*
+!models/.gitkeep
+auto_reframe/models/*
+!auto_reframe/models/.gitkeep
+*.bin
+*.pth
+*.task
+*.tflite
+*.onnx
+*.pt
+
+# Tools and binary executables (FFmpeg resolved via imageio-ffmpeg or system PATH)
+tools/*.exe
+tools/*.dll
+tools/*.so
+tools/*.dylib
+!tools/.gitkeep
+
+# Intermediate / Generated Pipeline Outputs in data directories
+auto_reframe/data/*.mp4
+auto_reframe/data/*.json
+!auto_reframe/data/.gitkeep
+auto_reframe phase 1-2/data/*.mp4
+auto_reframe phase 1-2/data/*.json
+!auto_reframe phase 1-2/data/.gitkeep
+
+# External cloned agency agents repo (compiled into .agents/ and AGENTS.md)
+agency-agents/
+
+# IDE / Editor configuration
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini

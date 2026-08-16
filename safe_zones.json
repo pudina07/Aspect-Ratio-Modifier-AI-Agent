@@ -1,0 +1,58 @@
+{
+  "version": "1.0",
+  "description": "Safe zone UI margin configurations for cross-platform auto-reframe rendering and QA validation.",
+  "platforms": {
+    "tiktok_916": {
+      "name": "TikTok",
+      "aspect_ratio": "9:16",
+      "canvas_width": 1080,
+      "canvas_height": 1920,
+      "margins": {
+        "top": 130,
+        "bottom": 380,
+        "left": 60,
+        "right": 170
+      },
+      "description": "TikTok standard 9:16 portrait. Accounts for top search/tab bar, bottom caption/sound rail, right engagement icons (like, comment, share, bookmark, avatar)."
+    },
+    "instagram_reels_916": {
+      "name": "Instagram Reels",
+      "aspect_ratio": "9:16",
+      "canvas_width": 1080,
+      "canvas_height": 1920,
+      "margins": {
+        "top": 220,
+        "bottom": 410,
+        "left": 30,
+        "right": 110
+      },
+      "description": "Instagram Reels 9:16 portrait. Accounts for top camera/status bar, bottom caption and audio attribution bar, right side icon stack."
+    },
+    "instagram_feed_11": {
+      "name": "Instagram Feed",
+      "aspect_ratio": "1:1",
+      "canvas_width": 1080,
+      "canvas_height": 1080,
+      "margins": {
+        "top": 20,
+        "bottom": 90,
+        "left": 20,
+        "right": 20
+      },
+      "description": "Instagram Feed 1:1 square. Minimal margins with bottom caption preview line safety buffer."
+    },
+    "youtube_shorts_916": {
+      "name": "YouTube Shorts",
+      "aspect_ratio": "9:16",
+      "canvas_width": 1080,
+      "canvas_height": 1920,
+      "margins": {
+        "top": 140,
+        "bottom": 360,
+        "left": 40,
+        "right": 130
+      },
+      "description": "YouTube Shorts 9:16 portrait. Accounts for top search/header, bottom subscribe and sound info, right action buttons."
+    }
+  }
+}
